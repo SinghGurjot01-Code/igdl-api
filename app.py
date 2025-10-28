@@ -9,7 +9,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import yt_dlp
 from flask_cors import CORS
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder='template')
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 CORS(app)
 
@@ -710,3 +710,4 @@ def internal_error(e):
 if __name__ == '__main__':
     logger.info("Starting Instagram Downloader in production mode")
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+
