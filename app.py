@@ -3,23 +3,22 @@ import uuid
 import logging
 import tempfile
 import shutil
-import threading
-import time
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file, render_template
 from werkzeug.middleware.proxy_fix import ProxyFix
 import yt_dlp
-from urllib.parse import urlparse
+from flask_cors import CORS
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+CORS(app)
 
 # Configuration
 DOWNLOAD_FOLDER = 'downloads'
 LOG_FOLDER = 'logs'
-MAX_FILE_AGE_HOURS = 1  # Auto-delete files older than 1 hour
-MAX_FILE_SIZE_MB = 100  # Maximum file size to download
-RATE_LIMIT_PER_HOUR = 50  # Max downloads per IP per hour
+MAX_FILE_AGE_HOURS = 1
+MAX_FILE_SIZE_MB = 100
+RATE_LIMIT_PER_HOUR = 50
 
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOG_FOLDER, exist_ok=True)
@@ -102,7 +101,7 @@ def check_rate_limit(ip_address):
 def cleanup_old_files():
     """Remove files older than MAX_FILE_AGE_HOURS"""
     try:
-        current_time = time.time()
+        current_time = datetime.now().timestamp()
         deleted_count = 0
         
         for filename in os.listdir(DOWNLOAD_FOLDER):
@@ -116,29 +115,14 @@ def cleanup_old_files():
         
         if deleted_count > 0:
             logger.info(f"Cleanup: Deleted {deleted_count} old files")
+            
+        return deleted_count
     except Exception as e:
         logger.error(f"Cleanup error: {str(e)}")
-
-def schedule_cleanup():
-    """Schedule periodic cleanup every hour"""
-    while True:
-        time.sleep(3600)
-        cleanup_old_files()
-
-# Start cleanup thread
-cleanup_thread = threading.Thread(target=schedule_cleanup, daemon=True)
-cleanup_thread.start()
+        return 0
 
 def log_download_attempt(url, success=True, error_msg=None, file_type=None, username=None):
     """Log download attempts"""
-    log_data = {
-        'timestamp': datetime.now().isoformat(),
-        'url': url,
-        'success': success,
-        'file_type': file_type,
-        'username': username
-    }
-    
     if success:
         logger.info(f"Download successful - URL: {url}, Type: {file_type}")
     else:
@@ -328,7 +312,7 @@ def download_stories_highlights_ytdlp(username, content_type='stories'):
 
 @app.before_request
 def before_request():
-    """Run cleanup check before requests"""
+    """Run cleanup check before requests (every 30 minutes)"""
     if not hasattr(app, '_last_cleanup'):
         app._last_cleanup = datetime.now()
     
