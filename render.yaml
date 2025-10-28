@@ -2,8 +2,14 @@ services:
   - type: web
     name: instagram-downloader
     env: python
-    buildCommand: pip install -r requirements.txt
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
     startCommand: gunicorn --config gunicorn.conf.py app:app
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
