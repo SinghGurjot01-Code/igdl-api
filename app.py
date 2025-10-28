@@ -4,12 +4,13 @@ import logging
 import tempfile
 import shutil
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, send_file, render_template
+from flask import Flask, request, jsonify, send_file
 from werkzeug.middleware.proxy_fix import ProxyFix
 import yt_dlp
 from flask_cors import CORS
 
-app = Flask(__name__, template_folder='template')
+# API-only Flask app (no template rendering)
+app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 CORS(app)
 
@@ -405,8 +406,12 @@ def before_request():
 
 @app.route('/')
 def index():
-    logger.info("Homepage accessed")
-    return render_template('index.html')
+    # API-only root to avoid TemplateNotFound errors when frontend is served separately
+    logger.info("Homepage (API) accessed")
+    return jsonify({
+        'message': 'Backend running. Serve your frontend separately (local or CDN).',
+        'cookies_configured': os.path.exists(COOKIES_FILE_PATH)
+    })
 
 @app.route('/health')
 def health_check():
@@ -417,7 +422,9 @@ def health_check():
         'cookies_configured': os.path.exists(COOKIES_FILE_PATH)
     })
 
+# ============================
 # NEW ENDPOINTS FOR FRONTEND COMPATIBILITY
+# ============================
 
 @app.route('/api/media/info', methods=['POST'])
 def get_media_info():
@@ -426,47 +433,30 @@ def get_media_info():
         data = request.get_json()
         if not data or 'url' not in data:
             return jsonify({'status': 'error', 'message': 'URL is required'}), 400
-        
+
         url = data['url'].strip()
-        
-        # Validate URL
         if not url.startswith(('https://www.instagram.com/', 'https://instagram.com/')):
             return jsonify({'status': 'error', 'message': 'Invalid Instagram URL'}), 400
-        
-        # Check cookies
+
         if not os.path.exists(COOKIES_FILE_PATH):
             return jsonify({
                 'status': 'error',
                 'message': 'Service not properly configured. Please contact administrator.'
             }), 503
-        
-        # Get media info
+
         media_info = get_media_info_ytdlp(url)
-        
-        return jsonify({
-            'status': 'ok',
-            'media_info': media_info
-        })
-        
+        return jsonify({'status': 'ok', 'media_info': media_info})
+
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Media info error: {error_msg}")
-        
         if 'Private' in error_msg or 'login' in error_msg.lower():
-            return jsonify({
-                'status': 'error',
-                'message': 'This content is private or requires authentication'
-            }), 401
+            return jsonify({'status': 'error', 'message': 'This content is private or requires authentication'}), 401
         elif 'not found' in error_msg.lower() or '404' in error_msg:
-            return jsonify({
-                'status': 'error',
-                'message': 'Media not found or no longer available'
-            }), 404
+            return jsonify({'status': 'error', 'message': 'Media not found or no longer available'}), 404
         else:
-            return jsonify({
-                'status': 'error',
-                'message': 'Failed to fetch media information'
-            }), 500
+            return jsonify({'status': 'error', 'message': 'Failed to fetch media information'}), 500
+
 
 @app.route('/api/stories-highlights/info', methods=['POST'])
 def get_stories_highlights_info_endpoint():
@@ -475,69 +465,49 @@ def get_stories_highlights_info_endpoint():
         data = request.get_json()
         if not data or 'username' not in data:
             return jsonify({'status': 'error', 'message': 'Username is required'}), 400
-        
+
         username = data['username'].strip().lstrip('@')
-        
         if not username:
             return jsonify({'status': 'error', 'message': 'Valid username is required'}), 400
-        
-        # Get stories and highlights info
+
         info = get_stories_highlights_info(username)
-        
         return jsonify({
             'status': 'ok',
             'username': username,
             'stories': info['stories'],
             'highlights': info['highlights']
         })
-        
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Stories/highlights info error: {error_msg}")
-        
-        return jsonify({
-            'status': 'error',
-            'message': 'Failed to fetch stories and highlights information'
-        }), 500
+        logger.error(f"Stories/highlights info error: {str(e)}")
+        return jsonify({'status': 'error', 'message': 'Failed to fetch stories and highlights information'}), 500
 
+
+# ============================
 # EXISTING ENDPOINTS
+# ============================
 
 @app.route('/api/download', methods=['POST'])
 def download_media():
     try:
-        # Get client IP
         client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
         if client_ip:
             client_ip = client_ip.split(',')[0].strip()
-        
-        # Rate limit check
+
         if not check_rate_limit(client_ip):
-            logger.warning(f"Rate limit exceeded for IP: {client_ip}")
-            return jsonify({
-                'status': 'error',
-                'message': 'Rate limit exceeded. Please try again later.'
-            }), 429
-        
+            return jsonify({'status': 'error', 'message': 'Rate limit exceeded. Please try again later.'}), 429
+
         data = request.get_json()
         if not data or 'url' not in data:
             return jsonify({'status': 'error', 'message': 'URL is required'}), 400
-        
+
         url = data['url'].strip()
-        
-        # Validate URL
         if not url.startswith(('https://www.instagram.com/', 'https://instagram.com/')):
             return jsonify({'status': 'error', 'message': 'Invalid Instagram URL'}), 400
-        
-        # Check cookies
+
         if not os.path.exists(COOKIES_FILE_PATH):
-            return jsonify({
-                'status': 'error',
-                'message': 'Service not properly configured. Please contact administrator.'
-            }), 503
-        
-        # Download media
+            return jsonify({'status': 'error', 'message': 'Service not properly configured. Please contact administrator.'}), 503
+
         result = download_media_ytdlp(url)
-        
         return jsonify({
             'status': 'ok',
             'type': result['type'],
@@ -550,62 +520,40 @@ def download_media():
             'like_count': result.get('like_count', 0),
             'comment_count': result.get('comment_count', 0)
         })
-        
+
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Download error: {error_msg}")
-        
         if 'Private' in error_msg or 'login' in error_msg.lower():
-            return jsonify({
-                'status': 'error',
-                'message': 'This content is private or requires authentication'
-            }), 401
+            return jsonify({'status': 'error', 'message': 'This content is private or requires authentication'}), 401
         elif 'not found' in error_msg.lower() or '404' in error_msg:
-            return jsonify({
-                'status': 'error',
-                'message': 'Media not found or no longer available'
-            }), 404
+            return jsonify({'status': 'error', 'message': 'Media not found or no longer available'}), 404
         elif 'timeout' in error_msg.lower():
-            return jsonify({
-                'status': 'error',
-                'message': 'Request timed out. Please try again.'
-            }), 504
+            return jsonify({'status': 'error', 'message': 'Request timed out. Please try again.'}), 504
         else:
-            return jsonify({
-                'status': 'error',
-                'message': 'Download failed. Please try again later.'
-            }), 500
+            return jsonify({'status': 'error', 'message': 'Download failed. Please try again later.'}), 500
+
 
 @app.route('/api/stories-highlights/download', methods=['POST'])
 def download_stories_highlights():
-    """Download stories or highlights"""
     try:
-        # Get client IP and check rate limit
         client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
         if client_ip:
             client_ip = client_ip.split(',')[0].strip()
-        
+
         if not check_rate_limit(client_ip):
-            return jsonify({
-                'status': 'error',
-                'message': 'Rate limit exceeded. Please try again later.'
-            }), 429
-        
+            return jsonify({'status': 'error', 'message': 'Rate limit exceeded. Please try again later.'}), 429
+
         data = request.get_json()
         if not data or 'username' not in data or 'content_type' not in data:
             return jsonify({'status': 'error', 'message': 'Username and content type are required'}), 400
-        
+
         username = data['username'].strip().lstrip('@')
         content_type = data['content_type']
-        
         if content_type not in ['stories', 'highlights']:
             return jsonify({'status': 'error', 'message': 'Content type must be "stories" or "highlights"'}), 400
-        
-        if not username:
-            return jsonify({'status': 'error', 'message': 'Valid username is required'}), 400
-        
+
         result = download_stories_highlights_ytdlp(username, content_type)
-        
         return jsonify({
             'status': 'ok',
             'content_type': content_type,
@@ -613,58 +561,45 @@ def download_stories_highlights():
             'files': result['files'],
             'count': result['count']
         })
-        
+
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Stories/highlights download error: {error_msg}")
-        
         if 'Private' in error_msg or 'login' in error_msg.lower():
-            return jsonify({
-                'status': 'error',
-                'message': 'This content is private or requires authentication'
-            }), 401
+            return jsonify({'status': 'error', 'message': 'This content is private or requires authentication'}), 401
         elif 'not found' in error_msg.lower():
-            return jsonify({
-                'status': 'error',
-                'message': f'No {data.get("content_type")} found for this user'
-            }), 404
+            return jsonify({'status': 'error', 'message': f'No {data.get("content_type")} found for this user'}), 404
         else:
-            return jsonify({
-                'status': 'error',
-                'message': 'Download failed. Please try again later.'
-            }), 500
+            return jsonify({'status': 'error', 'message': 'Download failed. Please try again later.'}), 500
+
 
 @app.route('/download/<filename>')
 def download_file(filename):
-    """Serve downloaded files"""
     try:
         safe_filename = sanitize_filename(filename)
         file_path = os.path.join(DOWNLOAD_FOLDER, safe_filename)
-        
+
         if not os.path.exists(file_path):
-            # Try to find file with UUID suffix
             base_name = filename.rsplit('_', 1)[0] if '_' in filename else filename
             matching_files = [f for f in os.listdir(DOWNLOAD_FOLDER) if f.startswith(base_name)]
-            
             if matching_files:
                 file_path = os.path.join(DOWNLOAD_FOLDER, matching_files[0])
             else:
                 return jsonify({'status': 'error', 'message': 'File not found or expired'}), 404
-        
+
         logger.info(f"File served: {filename}")
         return send_file(file_path, as_attachment=True, download_name=os.path.basename(file_path))
-        
+
     except Exception as e:
         logger.error(f"Error serving file {filename}: {str(e)}")
         return jsonify({'status': 'error', 'message': 'File not available'}), 500
 
+
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
-    """Get basic statistics"""
     try:
         download_files = [f for f in os.listdir(DOWNLOAD_FOLDER) if os.path.isfile(os.path.join(DOWNLOAD_FOLDER, f))]
         total_size = sum(os.path.getsize(os.path.join(DOWNLOAD_FOLDER, f)) for f in download_files)
-        
         return jsonify({
             'status': 'ok',
             'stats': {
@@ -678,25 +613,34 @@ def get_stats():
         logger.error(f"Stats error: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+
 @app.route('/api/logs', methods=['GET'])
 def get_logs():
-    """Get recent logs"""
     try:
         lines = request.args.get('lines', 100, type=int)
-        
         if not os.path.exists(log_file):
             return jsonify({'status': 'error', 'message': 'No logs available'}), 404
-        
         with open(log_file, 'r') as f:
             log_lines = f.readlines()[-lines:]
-        
-        return jsonify({
-            'status': 'ok',
-            'logs': log_lines,
-            'count': len(log_lines)
-        })
+        return jsonify({'status': 'ok', 'logs': log_lines, 'count': len(log_lines)})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+# ============================
+# ERROR HANDLERS
+# ============================
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'status': 'error', 'message': 'Endpoint not found'}), 404
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error(f"Internal server error: {str(e)}")
+    return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
+
 
 @app.errorhandler(404)
 def not_found(e):
@@ -710,4 +654,3 @@ def internal_error(e):
 if __name__ == '__main__':
     logger.info("Starting Instagram Downloader in production mode")
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
-
