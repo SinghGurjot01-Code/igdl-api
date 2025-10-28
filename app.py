@@ -19,15 +19,10 @@ LOG_FOLDER = 'logs'
 MAX_FILE_AGE_HOURS = 1
 MAX_FILE_SIZE_MB = 100
 RATE_LIMIT_PER_HOUR = 50
+COOKIES_FILE_PATH = '/etc/secrets/cookies.txt'
 
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOG_FOLDER, exist_ok=True)
-
-# Instagram cookies from environment variables
-INSTAGRAM_COOKIES = {
-    'csrftoken': os.environ.get('INSTAGRAM_CSRFTOKEN', ''),
-    'sessionid': os.environ.get('INSTAGRAM_SESSIONID', '')
-}
 
 # Setup logging
 log_file = os.path.join(LOG_FOLDER, 'igdl.log')
@@ -44,11 +39,11 @@ logger = logging.getLogger('IGDL')
 # Rate limiting storage (in-memory)
 download_tracker = {}
 
-# Check if cookies are configured
-if not INSTAGRAM_COOKIES['csrftoken'] or not INSTAGRAM_COOKIES['sessionid']:
-    logger.warning("⚠️ Instagram cookies not configured! Set INSTAGRAM_CSRFTOKEN and INSTAGRAM_SESSIONID environment variables.")
+# Check if cookies file exists
+if os.path.exists(COOKIES_FILE_PATH):
+    logger.info("✓ Instagram cookies loaded from secret file")
 else:
-    logger.info("✓ Instagram cookies loaded from environment variables")
+    logger.warning("⚠️ No cookies.txt found — Instagram private content may fail")
 
 def sanitize_filename(filename):
     """Enhanced filename sanitization with unique ID"""
@@ -57,25 +52,6 @@ def sanitize_filename(filename):
     name, ext = os.path.splitext(filename)
     unique_id = str(uuid.uuid4())[:8]
     return f"{name}_{unique_id}{ext}"
-
-def get_cookie_string():
-    """Convert cookie dict to string format"""
-    cookie_parts = []
-    for key, value in INSTAGRAM_COOKIES.items():
-        if value:
-            cookie_parts.append(f"{key}={value}")
-    return "; ".join(cookie_parts)
-
-def create_cookie_file(temp_dir):
-    """Create Netscape format cookie file for yt-dlp"""
-    cookie_file = os.path.join(temp_dir, 'cookies.txt')
-    with open(cookie_file, 'w') as f:
-        f.write('# Netscape HTTP Cookie File\n')
-        f.write('# This is a generated file! Do not edit.\n\n')
-        for key, value in INSTAGRAM_COOKIES.items():
-            if value:
-                f.write(f'.instagram.com\tTRUE\t/\tTRUE\t0\t{key}\t{value}\n')
-    return cookie_file
 
 def check_rate_limit(ip_address):
     """Simple rate limiting per IP"""
@@ -130,19 +106,14 @@ def log_download_attempt(url, success=True, error_msg=None, file_type=None, user
 
 def get_media_info_ytdlp(url):
     """Get media information without downloading"""
-    temp_dir = None
     try:
-        temp_dir = tempfile.mkdtemp()
-        cookie_file = create_cookie_file(temp_dir)
-        
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
-            'cookiefile': cookie_file,
+            'cookiefile': COOKIES_FILE_PATH,
             'extract_flat': False,
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Cookie': get_cookie_string()
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             },
             'socket_timeout': 30,
             'retries': 3,
@@ -204,9 +175,6 @@ def get_media_info_ytdlp(url):
     except Exception as e:
         logger.error(f"Error getting media info: {str(e)}")
         raise e
-    finally:
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
 
 def get_stories_highlights_info(username):
     """Get stories and highlights information"""
@@ -252,17 +220,15 @@ def download_media_ytdlp(url):
     temp_dir = None
     try:
         temp_dir = tempfile.mkdtemp()
-        cookie_file = create_cookie_file(temp_dir)
         
         ydl_opts = {
             'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
             'quiet': True,
             'no_warnings': True,
-            'cookiefile': cookie_file,
+            'cookiefile': COOKIES_FILE_PATH,
             'extract_flat': False,
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Cookie': get_cookie_string()
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             },
             'format': 'best[filesize<?100M]',
             'socket_timeout': 30,
@@ -356,7 +322,6 @@ def download_stories_highlights_ytdlp(username, content_type='stories'):
     temp_dir = None
     try:
         temp_dir = tempfile.mkdtemp()
-        cookie_file = create_cookie_file(temp_dir)
         
         if content_type == 'stories':
             url = f'https://www.instagram.com/stories/{username}/'
@@ -369,10 +334,9 @@ def download_stories_highlights_ytdlp(username, content_type='stories'):
             'outtmpl': outtmpl,
             'quiet': True,
             'no_warnings': True,
-            'cookiefile': cookie_file,
+            'cookiefile': COOKIES_FILE_PATH,
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Cookie': get_cookie_string()
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
         }
         
@@ -450,7 +414,7 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'cookies_configured': bool(INSTAGRAM_COOKIES['csrftoken'] and INSTAGRAM_COOKIES['sessionid'])
+        'cookies_configured': os.path.exists(COOKIES_FILE_PATH)
     })
 
 # NEW ENDPOINTS FOR FRONTEND COMPATIBILITY
@@ -470,7 +434,7 @@ def get_media_info():
             return jsonify({'status': 'error', 'message': 'Invalid Instagram URL'}), 400
         
         # Check cookies
-        if not INSTAGRAM_COOKIES['csrftoken'] or not INSTAGRAM_COOKIES['sessionid']:
+        if not os.path.exists(COOKIES_FILE_PATH):
             return jsonify({
                 'status': 'error',
                 'message': 'Service not properly configured. Please contact administrator.'
@@ -565,7 +529,7 @@ def download_media():
             return jsonify({'status': 'error', 'message': 'Invalid Instagram URL'}), 400
         
         # Check cookies
-        if not INSTAGRAM_COOKIES['csrftoken'] or not INSTAGRAM_COOKIES['sessionid']:
+        if not os.path.exists(COOKIES_FILE_PATH):
             return jsonify({
                 'status': 'error',
                 'message': 'Service not properly configured. Please contact administrator.'
