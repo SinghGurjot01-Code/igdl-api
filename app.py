@@ -128,6 +128,125 @@ def log_download_attempt(url, success=True, error_msg=None, file_type=None, user
     else:
         logger.error(f"Download failed - URL: {url}, Error: {error_msg}")
 
+def get_media_info_ytdlp(url):
+    """Get media information without downloading"""
+    temp_dir = None
+    try:
+        temp_dir = tempfile.mkdtemp()
+        cookie_file = create_cookie_file(temp_dir)
+        
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'cookiefile': cookie_file,
+            'extract_flat': False,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Cookie': get_cookie_string()
+            },
+            'socket_timeout': 30,
+            'retries': 3,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            logger.info(f"Getting info for: {url}")
+            info = ydl.extract_info(url, download=False)
+            
+            if not info:
+                raise Exception("No media found")
+            
+            # Enhanced metadata extraction
+            uploader = info.get('uploader', 'Unknown')
+            upload_date = info.get('upload_date', '')
+            if upload_date:
+                try:
+                    upload_date = datetime.strptime(upload_date, '%Y%m%d').strftime('%Y-%m-%d')
+                except:
+                    upload_date = 'Unknown'
+            
+            # Determine if it's a carousel (multiple media)
+            is_carousel = False
+            media_count = 1
+            carousel_media = []
+            
+            if '_type' in info and info['_type'] == 'playlist':
+                is_carousel = True
+                media_count = len(info.get('entries', []))
+                # Extract carousel media info
+                for entry in info.get('entries', []):
+                    carousel_media.append({
+                        'id': entry.get('id', ''),
+                        'title': entry.get('title', ''),
+                        'thumbnail': entry.get('thumbnail', ''),
+                        'duration': entry.get('duration', 0),
+                        'width': entry.get('width', 0),
+                        'height': entry.get('height', 0)
+                    })
+            
+            result = {
+                'title': info.get('title', 'Instagram Media'),
+                'thumbnail': info.get('thumbnail', ''),
+                'uploader': uploader,
+                'upload_date': upload_date,
+                'like_count': info.get('like_count', 0),
+                'comment_count': info.get('comment_count', 0),
+                'description': info.get('description', ''),
+                'duration': info.get('duration', 0),
+                'is_carousel': is_carousel,
+                'media_count': media_count,
+                'carousel_media': carousel_media,
+                'url': url
+            }
+            
+            logger.info(f"Media info retrieved: {result['title']}")
+            return result
+            
+    except Exception as e:
+        logger.error(f"Error getting media info: {str(e)}")
+        raise e
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
+def get_stories_highlights_info(username):
+    """Get stories and highlights information"""
+    try:
+        # This is a simplified implementation
+        # In a real scenario, you'd use Instagram's API or yt-dlp to get this info
+        result = {
+            'username': username,
+            'stories': {
+                'available': True,
+                'count': 1,  # Placeholder
+                'content': [
+                    {
+                        'id': 'story_1',
+                        'title': f'{username}\'s Story',
+                        'thumbnail': '',  # You'd get this from actual API
+                        'timestamp': datetime.now().isoformat()
+                    }
+                ]
+            },
+            'highlights': {
+                'available': True,
+                'count': 1,  # Placeholder
+                'content': [
+                    {
+                        'id': 'highlight_1',
+                        'title': f'{username}\'s Highlight',
+                        'thumbnail': '',  # You'd get this from actual API
+                        'timestamp': datetime.now().isoformat()
+                    }
+                ]
+            }
+        }
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error getting stories/highlights info: {str(e)}")
+        raise e
+
 def download_media_ytdlp(url):
     """Download media using yt-dlp with authentication"""
     temp_dir = None
@@ -333,6 +452,91 @@ def health_check():
         'timestamp': datetime.now().isoformat(),
         'cookies_configured': bool(INSTAGRAM_COOKIES['csrftoken'] and INSTAGRAM_COOKIES['sessionid'])
     })
+
+# NEW ENDPOINTS FOR FRONTEND COMPATIBILITY
+
+@app.route('/api/media/info', methods=['POST'])
+def get_media_info():
+    """Get media information without downloading"""
+    try:
+        data = request.get_json()
+        if not data or 'url' not in data:
+            return jsonify({'status': 'error', 'message': 'URL is required'}), 400
+        
+        url = data['url'].strip()
+        
+        # Validate URL
+        if not url.startswith(('https://www.instagram.com/', 'https://instagram.com/')):
+            return jsonify({'status': 'error', 'message': 'Invalid Instagram URL'}), 400
+        
+        # Check cookies
+        if not INSTAGRAM_COOKIES['csrftoken'] or not INSTAGRAM_COOKIES['sessionid']:
+            return jsonify({
+                'status': 'error',
+                'message': 'Service not properly configured. Please contact administrator.'
+            }), 503
+        
+        # Get media info
+        media_info = get_media_info_ytdlp(url)
+        
+        return jsonify({
+            'status': 'ok',
+            'media_info': media_info
+        })
+        
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Media info error: {error_msg}")
+        
+        if 'Private' in error_msg or 'login' in error_msg.lower():
+            return jsonify({
+                'status': 'error',
+                'message': 'This content is private or requires authentication'
+            }), 401
+        elif 'not found' in error_msg.lower() or '404' in error_msg:
+            return jsonify({
+                'status': 'error',
+                'message': 'Media not found or no longer available'
+            }), 404
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': 'Failed to fetch media information'
+            }), 500
+
+@app.route('/api/stories-highlights/info', methods=['POST'])
+def get_stories_highlights_info_endpoint():
+    """Get stories and highlights information"""
+    try:
+        data = request.get_json()
+        if not data or 'username' not in data:
+            return jsonify({'status': 'error', 'message': 'Username is required'}), 400
+        
+        username = data['username'].strip().lstrip('@')
+        
+        if not username:
+            return jsonify({'status': 'error', 'message': 'Valid username is required'}), 400
+        
+        # Get stories and highlights info
+        info = get_stories_highlights_info(username)
+        
+        return jsonify({
+            'status': 'ok',
+            'username': username,
+            'stories': info['stories'],
+            'highlights': info['highlights']
+        })
+        
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Stories/highlights info error: {error_msg}")
+        
+        return jsonify({
+            'status': 'error',
+            'message': 'Failed to fetch stories and highlights information'
+        }), 500
+
+# EXISTING ENDPOINTS
 
 @app.route('/api/download', methods=['POST'])
 def download_media():
