@@ -140,15 +140,21 @@ def get_ydl_opts(download=False, output_dir=None):
         'no_warnings': True,
         'extract_flat': False,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-us,en;q=0.5',
+            'Sec-Fetch-Mode': 'navigate',
         },
         'socket_timeout': 30,
         'retries': 3,
+        'fragment_retries': 3,
+        'skip_unavailable_fragments': True,
     }
     
     if download and output_dir:
         opts['outtmpl'] = os.path.join(output_dir, '%(title)s.%(ext)s')
-        opts['format'] = 'best[filesize<?100M]'
+        opts['format'] = 'best[filesize<?100M]/bestvideo[filesize<?100M]+bestaudio/best'
+        opts['merge_output_format'] = 'mp4'
     
     # Add cookies if available
     if COOKIES_FILE_PATH and os.path.exists(COOKIES_FILE_PATH):
@@ -215,6 +221,17 @@ def get_media_info_ytdlp(url):
             logger.info(f"Info retrieved: {result['title']}")
             return result
             
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e)
+        logger.error(f"yt-dlp download error: {error_msg}")
+        
+        # Check for specific errors
+        if "No video formats found" in error_msg:
+            raise Exception("This post format is not supported or Instagram has changed their API. Try updating yt-dlp or try a different post.")
+        elif "not available" in error_msg.lower():
+            raise Exception("This content is not available or has been deleted")
+        else:
+            raise Exception(f"Failed to fetch media: {error_msg}")
     except Exception as e:
         logger.error(f"Error getting media info: {str(e)}")
         raise e
