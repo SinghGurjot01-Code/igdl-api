@@ -183,25 +183,60 @@ def get_media_info_ytdlp(url):
                 except:
                     upload_date = 'Unknown'
             
-            # Check if carousel
+            # Enhanced carousel detection
             is_carousel = False
             media_count = 1
             carousel_media = []
             
-            if '_type' in info and info['_type'] == 'playlist':
+            # Check for playlist (carousel)
+            if info.get('_type') == 'playlist':
                 is_carousel = True
                 entries = info.get('entries', [])
                 media_count = len(entries)
                 
-                for entry in entries:
+                for i, entry in enumerate(entries):
+                    # Get the best available URL for each media item
+                    media_url = None
+                    if entry.get('url'):
+                        media_url = entry.get('url')
+                    elif entry.get('formats'):
+                        # Get the best format URL
+                        best_format = entry.get('formats')[-1]  # Usually the last one is best
+                        media_url = best_format.get('url')
+                    
                     carousel_media.append({
-                        'id': entry.get('id', ''),
-                        'title': entry.get('title', ''),
-                        'thumbnail': entry.get('thumbnail', ''),
+                        'id': entry.get('id', f'item_{i}'),
+                        'title': entry.get('title', f'Media {i+1}'),
+                        'thumbnail': entry.get('thumbnail', info.get('thumbnail', '')),
                         'duration': entry.get('duration', 0),
                         'width': entry.get('width', 0),
-                        'height': entry.get('height', 0)
+                        'height': entry.get('height', 0),
+                        'url': media_url,
+                        'index': i,
+                        'is_video': entry.get('duration', 0) > 0,
+                        'ext': entry.get('ext', 'mp4' if entry.get('duration', 0) > 0 else 'jpg')
                     })
+            else:
+                # Single media item
+                media_url = info.get('url')
+                if not media_url and info.get('formats'):
+                    best_format = info.get('formats')[-1]
+                    media_url = best_format.get('url')
+                
+                carousel_media.append({
+                    'id': info.get('id', 'single'),
+                    'title': info.get('title', 'Instagram Media'),
+                    'thumbnail': info.get('thumbnail', ''),
+                    'duration': info.get('duration', 0),
+                    'width': info.get('width', 0),
+                    'height': info.get('height', 0),
+                    'url': media_url,
+                    'index': 0,
+                    'is_video': info.get('duration', 0) > 0,
+                    'ext': info.get('ext', 'mp4' if info.get('duration', 0) > 0 else 'jpg')
+                })
+                media_count = 1
+                is_carousel = False
             
             result = {
                 'title': info.get('title', 'Instagram Media'),
@@ -218,7 +253,7 @@ def get_media_info_ytdlp(url):
                 'url': url
             }
             
-            logger.info(f"Info retrieved: {result['title']}")
+            logger.info(f"Info retrieved: {result['title']} - {media_count} media items")
             return result
             
     except yt_dlp.utils.DownloadError as e:
@@ -236,7 +271,7 @@ def get_media_info_ytdlp(url):
         logger.error(f"Error getting media info: {str(e)}")
         raise e
 
-def download_media_ytdlp(url):
+def download_media_ytdlp(url, item_index=None):
     """Download media using yt-dlp"""
     temp_dir = None
     try:
@@ -287,7 +322,8 @@ def download_media_ytdlp(url):
                     'filename': safe_filename,
                     'file_size': file_size,
                     'type': file_type,
-                    'download_url': f'/download/{safe_filename}'
+                    'download_url': f'/download/{safe_filename}',
+                    'original_name': filename
                 })
             
             shutil.rmtree(temp_dir)
@@ -309,7 +345,8 @@ def download_media_ytdlp(url):
                 'like_count': info.get('like_count', 0),
                 'comment_count': info.get('comment_count', 0),
                 'description': info.get('description', ''),
-                'duration': info.get('duration', 0)
+                'duration': info.get('duration', 0),
+                'is_carousel': info.get('_type') == 'playlist'
             }
             
     except Exception as e:
@@ -448,11 +485,35 @@ def download_media():
         if not url.startswith(('https://www.instagram.com/', 'https://instagram.com/')):
             return jsonify({'status': 'error', 'message': 'Invalid Instagram URL'}), 400
 
+        # Check if specific item is requested
+        item_index = data.get('item_index')
+        
         if not COOKIES_FILE_PATH or not os.path.exists(COOKIES_FILE_PATH):
             logger.warning("Attempting download without cookies")
 
         # Download
         result = download_media_ytdlp(url)
+        
+        # If specific item is requested, filter results
+        if item_index is not None and result.get('files'):
+            item_index = int(item_index)
+            if 0 <= item_index < len(result['files']):
+                # Return only the requested item
+                single_file = result['files'][item_index]
+                return jsonify({
+                    'status': 'ok',
+                    'type': single_file['type'],
+                    'files': [single_file],
+                    'count': 1,
+                    'preview_url': result.get('thumbnail', ''),
+                    'title': result.get('title', ''),
+                    'uploader': result.get('uploader', 'Unknown'),
+                    'upload_date': result.get('upload_date', ''),
+                    'like_count': result.get('like_count', 0),
+                    'comment_count': result.get('comment_count', 0),
+                    'is_carousel': result.get('is_carousel', False)
+                })
+
         return jsonify({
             'status': 'ok',
             'type': result['type'],
@@ -463,7 +524,8 @@ def download_media():
             'uploader': result.get('uploader', 'Unknown'),
             'upload_date': result.get('upload_date', ''),
             'like_count': result.get('like_count', 0),
-            'comment_count': result.get('comment_count', 0)
+            'comment_count': result.get('comment_count', 0),
+            'is_carousel': result.get('is_carousel', False)
         })
 
     except Exception as e:
