@@ -3,6 +3,7 @@ import uuid
 import logging
 import tempfile
 import shutil
+import json
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -134,41 +135,56 @@ def cleanup_old_files():
         return 0
 
 def get_ydl_opts(download=False, output_dir=None):
-    """Get yt-dlp options with or without cookies"""
+    """Get yt-dlp options with enhanced Instagram support"""
     opts = {
-        'quiet': True,
-        'no_warnings': True,
+        'quiet': False,
+        'no_warnings': False,
         'extract_flat': False,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-us,en;q=0.5',
             'Sec-Fetch-Mode': 'navigate',
+            'Referer': 'https://www.instagram.com/',
         },
         'socket_timeout': 30,
         'retries': 3,
         'fragment_retries': 3,
         'skip_unavailable_fragments': True,
+        'extractor_args': {
+            'instagram': {
+                'format': 'best',
+                'post_filter': 'none'
+            }
+        },
     }
     
     if download and output_dir:
         opts['outtmpl'] = os.path.join(output_dir, '%(title)s.%(ext)s')
-        opts['format'] = 'best[filesize<?100M]/bestvideo[filesize<?100M]+bestaudio/best'
+        # Enhanced format selection for Instagram
+        opts['format'] = 'best[filesize<?100M]/best'
         opts['merge_output_format'] = 'mp4'
     
     # Add cookies if available
     if COOKIES_FILE_PATH and os.path.exists(COOKIES_FILE_PATH):
         opts['cookiefile'] = COOKIES_FILE_PATH
-        logger.debug("Using cookies for request")
+        logger.info("Using cookies for Instagram request")
     else:
         logger.warning("No cookies available - private content may fail")
     
     return opts
 
 def get_media_info_ytdlp(url):
-    """Get media information without downloading"""
+    """Get media information without downloading with enhanced error handling"""
     try:
-        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+        # Enhanced yt-dlp options for Instagram
+        ydl_opts = get_ydl_opts()
+        ydl_opts.update({
+            'extract_flat': False,
+            'force_json': True,
+        })
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             logger.info(f"Fetching info for: {url}")
             info = ydl.extract_info(url, download=False)
             
@@ -192,36 +208,41 @@ def get_media_info_ytdlp(url):
             if info.get('_type') == 'playlist':
                 is_carousel = True
                 entries = info.get('entries', [])
-                media_count = len(entries)
+                media_count = len(entries) if entries else 1
                 
-                for i, entry in enumerate(entries):
-                    # Get the best available URL for each media item
-                    media_url = None
-                    if entry.get('url'):
-                        media_url = entry.get('url')
-                    elif entry.get('formats'):
-                        # Get the best format URL
-                        best_format = entry.get('formats')[-1]  # Usually the last one is best
-                        media_url = best_format.get('url')
-                    
-                    carousel_media.append({
-                        'id': entry.get('id', f'item_{i}'),
-                        'title': entry.get('title', f'Media {i+1}'),
-                        'thumbnail': entry.get('thumbnail', info.get('thumbnail', '')),
-                        'duration': entry.get('duration', 0),
-                        'width': entry.get('width', 0),
-                        'height': entry.get('height', 0),
-                        'url': media_url,
-                        'index': i,
-                        'is_video': entry.get('duration', 0) > 0,
-                        'ext': entry.get('ext', 'mp4' if entry.get('duration', 0) > 0 else 'jpg')
-                    })
+                if entries:
+                    for i, entry in enumerate(entries):
+                        # Get the best available URL for each media item
+                        media_url = None
+                        if entry.get('url'):
+                            media_url = entry.get('url')
+                        elif entry.get('formats'):
+                            # Get the best format URL
+                            formats = entry.get('formats', [])
+                            if formats:
+                                best_format = formats[-1]  # Usually the last one is best
+                                media_url = best_format.get('url')
+                        
+                        carousel_media.append({
+                            'id': entry.get('id', f'item_{i}'),
+                            'title': entry.get('title', f'Media {i+1}'),
+                            'thumbnail': entry.get('thumbnail', info.get('thumbnail', '')),
+                            'duration': entry.get('duration', 0),
+                            'width': entry.get('width', 0),
+                            'height': entry.get('height', 0),
+                            'url': media_url,
+                            'index': i,
+                            'is_video': entry.get('duration', 0) > 0,
+                            'ext': entry.get('ext', 'mp4' if entry.get('duration', 0) > 0 else 'jpg')
+                        })
             else:
                 # Single media item
                 media_url = info.get('url')
                 if not media_url and info.get('formats'):
-                    best_format = info.get('formats')[-1]
-                    media_url = best_format.get('url')
+                    formats = info.get('formats', [])
+                    if formats:
+                        best_format = formats[-1]
+                        media_url = best_format.get('url')
                 
                 carousel_media.append({
                     'id': info.get('id', 'single'),
@@ -260,11 +281,15 @@ def get_media_info_ytdlp(url):
         error_msg = str(e)
         logger.error(f"yt-dlp download error: {error_msg}")
         
-        # Check for specific errors
+        # Enhanced error handling for Instagram
         if "No video formats found" in error_msg:
             raise Exception("This post format is not supported or Instagram has changed their API. Try updating yt-dlp or try a different post.")
         elif "not available" in error_msg.lower():
             raise Exception("This content is not available or has been deleted")
+        elif "private" in error_msg.lower():
+            raise Exception("This content is private or requires login")
+        elif "rate limit" in error_msg.lower():
+            raise Exception("Rate limit exceeded. Please try again later.")
         else:
             raise Exception(f"Failed to fetch media: {error_msg}")
     except Exception as e:
@@ -272,7 +297,7 @@ def get_media_info_ytdlp(url):
         raise e
 
 def download_media_ytdlp(url, item_index=None):
-    """Download media using yt-dlp"""
+    """Download media using yt-dlp with enhanced error handling"""
     temp_dir = None
     try:
         temp_dir = tempfile.mkdtemp()
@@ -323,7 +348,8 @@ def download_media_ytdlp(url, item_index=None):
                     'file_size': file_size,
                     'type': file_type,
                     'download_url': f'/download/{safe_filename}',
-                    'original_name': filename
+                    'original_name': filename,
+                    'available': True
                 })
             
             shutil.rmtree(temp_dir)
@@ -349,6 +375,20 @@ def download_media_ytdlp(url, item_index=None):
                 'is_carousel': info.get('_type') == 'playlist'
             }
             
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e)
+        logger.error(f"yt-dlp download error: {error_msg}")
+        
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            
+        # Enhanced error handling
+        if "No video formats found" in error_msg:
+            raise Exception("This post format is not supported. Try a different post or check if the content is available.")
+        elif "private" in error_msg.lower():
+            raise Exception("This content is private or requires login")
+        else:
+            raise Exception(f"Download failed: {error_msg}")
     except Exception as e:
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
@@ -373,7 +413,7 @@ def index():
     return jsonify({
         'status': 'online',
         'service': 'Instagram Downloader API',
-        'version': '2.0',
+        'version': '2.1',
         'cookies_configured': cookies_ok,
         'endpoints': {
             'health': '/health',
@@ -435,9 +475,12 @@ def debug_info():
     
     return jsonify(info)
 
-@app.route('/api/media/info', methods=['POST'])
+@app.route('/api/media/info', methods=['POST', 'OPTIONS'])
 def get_media_info():
     """Get media information without downloading"""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         data = request.get_json()
         if not data or 'url' not in data:
@@ -461,12 +504,19 @@ def get_media_info():
             return jsonify({'status': 'error', 'message': 'This content is private or requires authentication'}), 401
         elif 'not found' in error_msg.lower() or '404' in error_msg:
             return jsonify({'status': 'error', 'message': 'Media not found'}), 404
+        elif 'rate limit' in error_msg.lower():
+            return jsonify({'status': 'error', 'message': 'Rate limit exceeded. Please try again later.'}), 429
+        elif 'not supported' in error_msg.lower():
+            return jsonify({'status': 'error', 'message': 'This post format is not supported. Try a different post.'}), 400
         else:
             return jsonify({'status': 'error', 'message': 'Failed to fetch media information'}), 500
 
-@app.route('/api/download', methods=['POST'])
+@app.route('/api/download', methods=['POST', 'OPTIONS'])
 def download_media():
     """Download Instagram media"""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         # Rate limiting
         client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
@@ -492,7 +542,7 @@ def download_media():
             logger.warning("Attempting download without cookies")
 
         # Download
-        result = download_media_ytdlp(url)
+        result = download_media_ytdlp(url, item_index)
         
         # If specific item is requested, filter results
         if item_index is not None and result.get('files'):
@@ -538,6 +588,10 @@ def download_media():
             return jsonify({'status': 'error', 'message': 'Media not found'}), 404
         elif 'timeout' in error_msg.lower():
             return jsonify({'status': 'error', 'message': 'Request timed out'}), 504
+        elif 'not supported' in error_msg.lower():
+            return jsonify({'status': 'error', 'message': 'This post format is not supported'}), 400
+        elif 'rate limit' in error_msg.lower():
+            return jsonify({'status': 'error', 'message': 'Rate limit exceeded. Please try again later.'}), 429
         else:
             return jsonify({'status': 'error', 'message': 'Download failed'}), 500
 
