@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: instagram-downloader
+    name: instagram-downloader-api
     env: python
     runtime: python
     region: oregon
@@ -10,14 +10,12 @@ services:
       pip install --upgrade pip
       pip install -r requirements.txt
 
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers=2 --threads=4 --timeout=120
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers=2 --threads=4 --timeout=120 --log-level info
 
     healthCheckPath: /health
 
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
-      - key: INSTAGRAM_CSRFTOKEN
-        sync: false   # Add your cookie value in Render Dashboard
-      - key: INSTAGRAM_SESSIONID
-        sync: false   # Add your session ID in Render Dashboard
+      - key: LOG_LEVEL
+        value: INFO
