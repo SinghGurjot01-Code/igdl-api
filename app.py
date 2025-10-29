@@ -5,6 +5,7 @@ import tempfile
 import shutil
 import json
 import re
+import io
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -16,10 +17,8 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Configuration
-DOWNLOAD_FOLDER = 'downloads'
+# Configuration - No longer using persistent download folder
 LOG_FOLDER = 'logs'
-MAX_FILE_AGE_HOURS = 1
 MAX_FILE_SIZE_MB = 100
 RATE_LIMIT_PER_HOUR = 50
 
@@ -64,7 +63,6 @@ def get_cookies_file_path():
     return None
 
 # Create necessary directories
-os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOG_FOLDER, exist_ok=True)
 
 # Setup logging
@@ -111,29 +109,6 @@ def check_rate_limit(ip_address):
     
     download_tracker[ip_address].append(current_time)
     return True
-
-def cleanup_old_files():
-    """Remove files older than MAX_FILE_AGE_HOURS"""
-    try:
-        current_time = datetime.now().timestamp()
-        deleted_count = 0
-        
-        for filename in os.listdir(DOWNLOAD_FOLDER):
-            file_path = os.path.join(DOWNLOAD_FOLDER, filename)
-            if os.path.isfile(file_path):
-                file_age_hours = (current_time - os.path.getmtime(file_path)) / 3600
-                if file_age_hours > MAX_FILE_AGE_HOURS:
-                    os.remove(file_path)
-                    deleted_count += 1
-                    logger.info(f"Auto-deleted old file: {filename}")
-        
-        if deleted_count > 0:
-            logger.info(f"Cleanup: Deleted {deleted_count} old files")
-            
-        return deleted_count
-    except Exception as e:
-        logger.error(f"Cleanup error: {str(e)}")
-        return 0
 
 def get_ydl_opts(download=False, output_dir=None):
     """Get yt-dlp options with enhanced Instagram support"""
@@ -330,8 +305,8 @@ def get_media_info_ytdlp(url):
         logger.error(f"Error getting media info: {str(e)}")
         raise e
 
-def download_media_ytdlp(url, item_index=None):
-    """Download media using yt-dlp with enhanced error handling"""
+def download_media_to_buffer(url, item_index=None):
+    """Download media directly to memory buffer and return file data"""
     temp_dir = None
     try:
         temp_dir = tempfile.mkdtemp()
@@ -343,14 +318,6 @@ def download_media_ytdlp(url, item_index=None):
             if not info:
                 raise Exception("No media found")
             
-            # Parse metadata
-            upload_date = info.get('upload_date', '')
-            if upload_date:
-                try:
-                    upload_date = datetime.strptime(upload_date, '%Y%m%d').strftime('%Y-%m-%d')
-                except:
-                    upload_date = 'Unknown'
-            
             # Find downloaded files
             downloaded_files = []
             for root, dirs, files in os.walk(temp_dir):
@@ -361,8 +328,8 @@ def download_media_ytdlp(url, item_index=None):
             if not downloaded_files:
                 raise Exception("No files downloaded")
             
-            # Process files
-            results = []
+            # Process files - read into memory
+            file_data_list = []
             for downloaded_file in downloaded_files:
                 filename = os.path.basename(downloaded_file)
                 file_size = os.path.getsize(downloaded_file)
@@ -371,41 +338,33 @@ def download_media_ytdlp(url, item_index=None):
                     logger.warning(f"File too large: {file_size / (1024*1024):.2f}MB")
                     continue
                 
-                safe_filename = sanitize_filename(filename)
-                final_path = os.path.join(DOWNLOAD_FOLDER, safe_filename)
-                shutil.move(downloaded_file, final_path)
+                # Read file into memory
+                with open(downloaded_file, 'rb') as f:
+                    file_data = io.BytesIO(f.read())
                 
+                safe_filename = sanitize_filename(filename)
                 file_type = 'video' if downloaded_file.endswith(('.mp4', '.mkv', '.avi')) else 'image'
                 
-                results.append({
+                file_data_list.append({
                     'filename': safe_filename,
+                    'file_data': file_data,
                     'file_size': file_size,
                     'type': file_type,
-                    'download_url': f'/download/{safe_filename}',
-                    'original_name': filename,
-                    'available': True
+                    'original_name': filename
                 })
             
-            shutil.rmtree(temp_dir)
+            # Clean up temp directory
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
             
-            if not results:
+            if not file_data_list:
                 raise Exception("No valid files downloaded")
             
-            logger.info(f"Successfully downloaded {len(results)} file(s)")
+            logger.info(f"Successfully downloaded {len(file_data_list)} file(s) to memory")
             
             return {
-                'status': 'success',
-                'type': 'multiple' if len(results) > 1 else results[0]['type'],
-                'files': results,
-                'count': len(results),
-                'title': info.get('title', 'Instagram Media'),
-                'thumbnail': info.get('thumbnail', ''),
-                'uploader': info.get('uploader', 'Unknown'),
-                'upload_date': upload_date,
-                'like_count': info.get('like_count', 0),
-                'comment_count': info.get('comment_count', 0),
-                'description': info.get('description', ''),
-                'duration': info.get('duration', 0),
+                'files': file_data_list,
+                'info': info,
                 'is_carousel': info.get('_type') == 'playlist'
             }
             
@@ -430,141 +389,28 @@ def download_media_ytdlp(url, item_index=None):
 
 @app.before_request
 def before_request():
-    """Periodic cleanup"""
-    if not hasattr(app, '_last_cleanup'):
-        app._last_cleanup = datetime.now()
-    
-    if datetime.now() - app._last_cleanup > timedelta(minutes=30):
-        cleanup_old_files()
-        app._last_cleanup = datetime.now()
+    """Periodic cleanup - simplified since we're not storing files anymore"""
+    pass
 
 # ==================== ROUTES ====================
 
 @app.route('/')
 def index():
     """Serve the main HTML page"""
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>IGDL - Instagram Downloader</title>
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-        <style>
-            /* Add your CSS styles here */
-            body {
-                font-family: Arial, sans-serif;
-                margin: 0;
-                padding: 20px;
-                background: #f5f5f5;
-            }
-            .container {
-                max-width: 800px;
-                margin: 0 auto;
-                background: white;
-                padding: 20px;
-                border-radius: 10px;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            }
-            h1 {
-                color: #333;
-                text-align: center;
-            }
-            .input-group {
-                margin: 20px 0;
-            }
-            input[type="text"] {
-                width: 100%;
-                padding: 10px;
-                border: 1px solid #ddd;
-                border-radius: 5px;
-                font-size: 16px;
-            }
-            button {
-                background: #405DE6;
-                color: white;
-                border: none;
-                padding: 10px 20px;
-                border-radius: 5px;
-                cursor: pointer;
-                font-size: 16px;
-            }
-            button:hover {
-                background: #3742FA;
-            }
-            .result {
-                margin-top: 20px;
-                padding: 15px;
-                border-radius: 5px;
-                display: none;
-            }
-            .success {
-                background: #d4edda;
-                border: 1px solid #c3e6cb;
-                color: #155724;
-            }
-            .error {
-                background: #f8d7da;
-                border: 1px solid #f5c6cb;
-                color: #721c24;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1><i class="fab fa-instagram"></i> IGDL - Instagram Downloader</h1>
-            <div class="input-group">
-                <input type="text" id="urlInput" placeholder="Paste Instagram URL here...">
-                <button onclick="fetchMediaInfo()">Get Download Options</button>
-            </div>
-            <div id="result" class="result"></div>
-        </div>
-
-        <script>
-            async function fetchMediaInfo() {
-                const url = document.getElementById('urlInput').value.trim();
-                const resultDiv = document.getElementById('result');
-                
-                if (!url) {
-                    showResult('Please enter an Instagram URL', 'error');
-                    return;
-                }
-
-                showResult('Fetching media information...', 'info');
-
-                try {
-                    const response = await fetch('/api/media/info', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({ url: url })
-                    });
-
-                    const data = await response.json();
-
-                    if (response.ok) {
-                        showResult(`Success! Found: ${data.media_info.title}`, 'success');
-                        // Here you would add download buttons based on the media info
-                    } else {
-                        showResult(`Error: ${data.message}`, 'error');
-                    }
-                } catch (error) {
-                    showResult(`Network error: ${error.message}`, 'error');
-                }
-            }
-
-            function showResult(message, type) {
-                const resultDiv = document.getElementById('result');
-                resultDiv.textContent = message;
-                resultDiv.className = 'result ' + type;
-                resultDiv.style.display = 'block';
-            }
-        </script>
-    </body>
-    </html>
-    """
+    try:
+        with open('index.html', 'r', encoding='utf-8') as f:
+            return f.read()
+    except FileNotFoundError:
+        return """
+        <!DOCTYPE html>
+        <html>
+        <head><title>IGDL - Instagram Downloader</title></head>
+        <body>
+            <h1>IGDL - Instagram Downloader</h1>
+            <p>Frontend file not found. Please make sure index.html is deployed.</p>
+        </body>
+        </html>
+        """
 
 @app.route('/health')
 def health_check():
@@ -575,7 +421,8 @@ def health_check():
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
         'cookies_configured': cookies_ok,
-        'cookies_path': COOKIES_FILE_PATH if cookies_ok else None
+        'cookies_path': COOKIES_FILE_PATH if cookies_ok else None,
+        'storage': 'memory_buffer'  # Indicate we're using memory buffers now
     })
 
 @app.route('/debug/info')
@@ -590,10 +437,8 @@ def debug_info():
             'writable': False
         },
         'paths_checked': COOKIES_FILE_PATHS,
-        'directories': {
-            'downloads': os.path.exists(DOWNLOAD_FOLDER),
-            'logs': os.path.exists(LOG_FOLDER)
-        }
+        'storage_mode': 'memory_buffer',
+        'max_file_size_mb': MAX_FILE_SIZE_MB
     }
     
     # Add file info if cookies exist
@@ -660,7 +505,7 @@ def get_media_info():
 
 @app.route('/api/download', methods=['POST', 'OPTIONS'])
 def download_media():
-    """Download Instagram media"""
+    """Download Instagram media directly to client"""
     if request.method == 'OPTIONS':
         return '', 200
         
@@ -688,42 +533,34 @@ def download_media():
         if not COOKIES_FILE_PATH or not os.path.exists(COOKIES_FILE_PATH):
             logger.warning("Attempting download without cookies")
 
-        # Download
-        result = download_media_ytdlp(url, item_index)
+        # Download to memory buffer
+        result = download_media_to_buffer(url, item_index)
         
-        # If specific item is requested, filter results
-        if item_index is not None and result.get('files'):
-            item_index = int(item_index)
-            if 0 <= item_index < len(result['files']):
-                # Return only the requested item
-                single_file = result['files'][item_index]
-                return jsonify({
-                    'status': 'ok',
-                    'type': single_file['type'],
-                    'files': [single_file],
-                    'count': 1,
-                    'preview_url': result.get('thumbnail', ''),
-                    'title': result.get('title', ''),
-                    'uploader': result.get('uploader', 'Unknown'),
-                    'upload_date': result.get('upload_date', ''),
-                    'like_count': result.get('like_count', 0),
-                    'comment_count': result.get('comment_count', 0),
-                    'is_carousel': result.get('is_carousel', False)
-                })
-
-        return jsonify({
-            'status': 'ok',
-            'type': result['type'],
-            'files': result.get('files', []),
-            'count': result.get('count', 1),
-            'preview_url': result.get('thumbnail', ''),
-            'title': result.get('title', ''),
-            'uploader': result.get('uploader', 'Unknown'),
-            'upload_date': result.get('upload_date', ''),
-            'like_count': result.get('like_count', 0),
-            'comment_count': result.get('comment_count', 0),
-            'is_carousel': result.get('is_carousel', False)
-        })
+        # Handle single file download
+        if len(result['files']) == 1:
+            file_data = result['files'][0]
+            return send_file(
+                file_data['file_data'],
+                as_attachment=True,
+                download_name=file_data['filename'],
+                mimetype='video/mp4' if file_data['type'] == 'video' else 'image/jpeg'
+            )
+        
+        # Handle multiple files (carousel) - for now, return first file
+        # In a more advanced implementation, you could create a zip file
+        elif result['files']:
+            file_data = result['files'][0]
+            if item_index is not None and 0 <= int(item_index) < len(result['files']):
+                file_data = result['files'][int(item_index)]
+            
+            return send_file(
+                file_data['file_data'],
+                as_attachment=True,
+                download_name=file_data['filename'],
+                mimetype='video/mp4' if file_data['type'] == 'video' else 'image/jpeg'
+            )
+        else:
+            raise Exception("No files available for download")
 
     except Exception as e:
         error_msg = str(e)
@@ -742,42 +579,17 @@ def download_media():
         else:
             return jsonify({'status': 'error', 'message': 'Download failed'}), 500
 
-@app.route('/download/<filename>')
-def download_file(filename):
-    """Serve downloaded file"""
-    try:
-        safe_filename = sanitize_filename(filename)
-        file_path = os.path.join(DOWNLOAD_FOLDER, safe_filename)
-
-        if not os.path.exists(file_path):
-            # Try to find similar filename
-            base_name = filename.rsplit('_', 1)[0] if '_' in filename else filename
-            matching_files = [f for f in os.listdir(DOWNLOAD_FOLDER) if f.startswith(base_name)]
-            if matching_files:
-                file_path = os.path.join(DOWNLOAD_FOLDER, matching_files[0])
-            else:
-                return jsonify({'status': 'error', 'message': 'File not found or expired'}), 404
-
-        logger.info(f"Serving file: {filename}")
-        return send_file(file_path, as_attachment=True, download_name=os.path.basename(file_path))
-
-    except Exception as e:
-        logger.error(f"Error serving file {filename}: {str(e)}")
-        return jsonify({'status': 'error', 'message': 'File not available'}), 500
+# Remove the old /download/<filename> endpoint since we're not storing files anymore
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     """Get service statistics"""
     try:
-        download_files = [f for f in os.listdir(DOWNLOAD_FOLDER) if os.path.isfile(os.path.join(DOWNLOAD_FOLDER, f))]
-        total_size = sum(os.path.getsize(os.path.join(DOWNLOAD_FOLDER, f)) for f in download_files)
-        
         return jsonify({
             'status': 'ok',
             'stats': {
-                'cached_files': len(download_files),
-                'total_size_mb': round(total_size / (1024 * 1024), 2),
-                'max_age_hours': MAX_FILE_AGE_HOURS,
+                'storage_mode': 'memory_buffer',
+                'max_file_size_mb': MAX_FILE_SIZE_MB,
                 'rate_limit_per_hour': RATE_LIMIT_PER_HOUR,
                 'cookies_configured': COOKIES_FILE_PATH is not None
             }
@@ -886,7 +698,7 @@ if __name__ == '__main__':
     logger.info("=" * 50)
     logger.info("Instagram Downloader API Starting")
     logger.info(f"Cookies configured: {COOKIES_FILE_PATH is not None}")
-    logger.info(f"Download folder: {DOWNLOAD_FOLDER}")
+    logger.info("Storage mode: Memory buffer (no persistent files)")
     logger.info(f"Log folder: {LOG_FOLDER}")
     logger.info("=" * 50)
     
