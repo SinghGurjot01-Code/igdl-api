@@ -23,20 +23,35 @@ RATE_LIMIT_PER_HOUR = 50
 
 # Cookie file paths (checked in order)
 COOKIES_FILE_PATHS = [
-    '/etc/secrets/cookies.txt',  # Render Secret Files (primary)
+    '/etc/secrets/cookies.txt',  # Render Secret Files (read-only)
     './cookies.txt',             # Local development
     '/tmp/cookies.txt'           # Temporary fallback
 ]
 
 def get_cookies_file_path():
-    """Find and validate cookies file"""
+    """Find cookies file and copy to writable location if needed"""
+    writable_path = '/tmp/cookies.txt'
+    
+    # Check all possible paths
     for path in COOKIES_FILE_PATHS:
         if os.path.exists(path):
             try:
                 size = os.path.getsize(path)
                 if size > 0:
-                    logger.info(f"✓ Found valid cookies file: {path} ({size} bytes)")
-                    return path
+                    logger.info(f"✓ Found cookies file: {path} ({size} bytes)")
+                    
+                    # If it's in read-only /etc/secrets, copy to /tmp
+                    if path.startswith('/etc/secrets/'):
+                        try:
+                            shutil.copy2(path, writable_path)
+                            logger.info(f"✓ Copied cookies to writable location: {writable_path}")
+                            return writable_path
+                        except Exception as e:
+                            logger.error(f"Failed to copy cookies: {str(e)}")
+                            return None
+                    else:
+                        # Already in writable location
+                        return path
                 else:
                     logger.warning(f"⚠️ Cookies file is empty: {path}")
             except Exception as e:
@@ -335,7 +350,8 @@ def debug_info():
         'cookies': {
             'configured': COOKIES_FILE_PATH is not None,
             'path': COOKIES_FILE_PATH,
-            'exists': os.path.exists(COOKIES_FILE_PATH) if COOKIES_FILE_PATH else False
+            'exists': os.path.exists(COOKIES_FILE_PATH) if COOKIES_FILE_PATH else False,
+            'writable': False
         },
         'paths_checked': COOKIES_FILE_PATHS,
         'directories': {
@@ -348,6 +364,15 @@ def debug_info():
     if COOKIES_FILE_PATH and os.path.exists(COOKIES_FILE_PATH):
         try:
             info['cookies']['size'] = os.path.getsize(COOKIES_FILE_PATH)
+            
+            # Check if writable
+            try:
+                with open(COOKIES_FILE_PATH, 'a'):
+                    pass
+                info['cookies']['writable'] = True
+            except:
+                info['cookies']['writable'] = False
+            
             with open(COOKIES_FILE_PATH, 'r') as f:
                 first_lines = [f.readline().strip() for _ in range(3)]
             info['cookies']['preview'] = first_lines
