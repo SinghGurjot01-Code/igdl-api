@@ -4,6 +4,7 @@ import logging
 import tempfile
 import shutil
 import json
+import re
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -174,6 +175,20 @@ def get_ydl_opts(download=False, output_dir=None):
     
     return opts
 
+def is_valid_instagram_url(url):
+    """Enhanced Instagram URL validation"""
+    instagram_patterns = [
+        r'https?://(www\.)?instagram\.com/(p|reel|stories|story)/[^/]+/?',
+        r'https?://(www\.)?instagram\.com/stories/highlight/[\w_-]+/?',
+        r'https?://(www\.)?instagram\.com/tv/[\w_-]+/?',
+        r'https?://(www\.)?instagram\.com/reel/[\w_-]+/?'
+    ]
+    
+    for pattern in instagram_patterns:
+        if re.match(pattern, url, re.IGNORECASE):
+            return True
+    return False
+
 def get_media_info_ytdlp(url):
     """Get media information without downloading with enhanced error handling"""
     try:
@@ -182,14 +197,33 @@ def get_media_info_ytdlp(url):
         ydl_opts.update({
             'extract_flat': False,
             'force_json': True,
+            'ignoreerrors': True,
         })
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             logger.info(f"Fetching info for: {url}")
-            info = ydl.extract_info(url, download=False)
+            
+            # Test if URL is accessible first
+            try:
+                info = ydl.extract_info(url, download=False)
+            except yt_dlp.utils.DownloadError as e:
+                error_msg = str(e)
+                logger.error(f"yt-dlp extraction failed: {error_msg}")
+                
+                # More specific error messages
+                if "Private" in error_msg or "login" in error_msg:
+                    raise Exception("This content is private or requires login. Make sure you're using valid cookies.")
+                elif "not found" in error_msg.lower() or "removed" in error_msg.lower():
+                    raise Exception("This content is not available or has been removed from Instagram.")
+                elif "URL could be wrong" in error_msg:
+                    raise Exception("Invalid Instagram URL. Please check the URL and try again.")
+                elif "Unsupported URL" in error_msg:
+                    raise Exception("This Instagram URL format is not supported.")
+                else:
+                    raise Exception(f"Instagram returned an error: {error_msg}")
             
             if not info:
-                raise Exception("No media found")
+                raise Exception("No media found at this URL. The post might be private or deleted.")
             
             # Parse upload date
             upload_date = info.get('upload_date', '')
@@ -408,21 +442,129 @@ def before_request():
 
 @app.route('/')
 def index():
-    """API root endpoint"""
-    cookies_ok = COOKIES_FILE_PATH is not None and os.path.exists(COOKIES_FILE_PATH)
-    return jsonify({
-        'status': 'online',
-        'service': 'Instagram Downloader API',
-        'version': '2.1',
-        'cookies_configured': cookies_ok,
-        'endpoints': {
-            'health': '/health',
-            'download': '/api/download',
-            'media_info': '/api/media/info',
-            'stats': '/api/stats',
-            'debug': '/debug/info'
-        }
-    })
+    """Serve the main HTML page"""
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>IGDL - Instagram Downloader</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <style>
+            /* Add your CSS styles here */
+            body {
+                font-family: Arial, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background: #f5f5f5;
+            }
+            .container {
+                max-width: 800px;
+                margin: 0 auto;
+                background: white;
+                padding: 20px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            h1 {
+                color: #333;
+                text-align: center;
+            }
+            .input-group {
+                margin: 20px 0;
+            }
+            input[type="text"] {
+                width: 100%;
+                padding: 10px;
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                font-size: 16px;
+            }
+            button {
+                background: #405DE6;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                cursor: pointer;
+                font-size: 16px;
+            }
+            button:hover {
+                background: #3742FA;
+            }
+            .result {
+                margin-top: 20px;
+                padding: 15px;
+                border-radius: 5px;
+                display: none;
+            }
+            .success {
+                background: #d4edda;
+                border: 1px solid #c3e6cb;
+                color: #155724;
+            }
+            .error {
+                background: #f8d7da;
+                border: 1px solid #f5c6cb;
+                color: #721c24;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1><i class="fab fa-instagram"></i> IGDL - Instagram Downloader</h1>
+            <div class="input-group">
+                <input type="text" id="urlInput" placeholder="Paste Instagram URL here...">
+                <button onclick="fetchMediaInfo()">Get Download Options</button>
+            </div>
+            <div id="result" class="result"></div>
+        </div>
+
+        <script>
+            async function fetchMediaInfo() {
+                const url = document.getElementById('urlInput').value.trim();
+                const resultDiv = document.getElementById('result');
+                
+                if (!url) {
+                    showResult('Please enter an Instagram URL', 'error');
+                    return;
+                }
+
+                showResult('Fetching media information...', 'info');
+
+                try {
+                    const response = await fetch('/api/media/info', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ url: url })
+                    });
+
+                    const data = await response.json();
+
+                    if (response.ok) {
+                        showResult(`Success! Found: ${data.media_info.title}`, 'success');
+                        // Here you would add download buttons based on the media info
+                    } else {
+                        showResult(`Error: ${data.message}`, 'error');
+                    }
+                } catch (error) {
+                    showResult(`Network error: ${error.message}`, 'error');
+                }
+            }
+
+            function showResult(message, type) {
+                const resultDiv = document.getElementById('result');
+                resultDiv.textContent = message;
+                resultDiv.className = 'result ' + type;
+                resultDiv.style.display = 'block';
+            }
+        </script>
+    </body>
+    </html>
+    """
 
 @app.route('/health')
 def health_check():
@@ -487,8 +629,13 @@ def get_media_info():
             return jsonify({'status': 'error', 'message': 'URL is required'}), 400
 
         url = data['url'].strip()
-        if not url.startswith(('https://www.instagram.com/', 'https://instagram.com/')):
-            return jsonify({'status': 'error', 'message': 'Invalid Instagram URL'}), 400
+        
+        # Enhanced URL validation
+        if not is_valid_instagram_url(url):
+            return jsonify({
+                'status': 'error', 
+                'message': 'Invalid Instagram URL. Supported formats: Posts (instagram.com/p/...), Reels (instagram.com/reel/...), Stories (instagram.com/stories/...), TV (instagram.com/tv/...)'
+            }), 400
 
         if not COOKIES_FILE_PATH or not os.path.exists(COOKIES_FILE_PATH):
             logger.warning("Attempting to fetch info without cookies")
@@ -532,7 +679,7 @@ def download_media():
             return jsonify({'status': 'error', 'message': 'URL is required'}), 400
 
         url = data['url'].strip()
-        if not url.startswith(('https://www.instagram.com/', 'https://instagram.com/')):
+        if not is_valid_instagram_url(url):
             return jsonify({'status': 'error', 'message': 'Invalid Instagram URL'}), 400
 
         # Check if specific item is requested
@@ -657,6 +804,66 @@ def get_logs():
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# ==================== STORIES & HIGHLIGHTS ROUTES ====================
+
+@app.route('/api/stories-highlights/info', methods=['POST', 'OPTIONS'])
+def get_stories_highlights_info():
+    """Get stories and highlights information (placeholder)"""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
+    try:
+        data = request.get_json()
+        if not data or 'username' not in data:
+            return jsonify({'status': 'error', 'message': 'Username is required'}), 400
+
+        username = data['username'].strip()
+        
+        # Placeholder response - in a real implementation, you would fetch actual stories/highlights
+        return jsonify({
+            'status': 'ok',
+            'username': username,
+            'stories': {
+                'available': False,
+                'count': 0,
+                'content': []
+            },
+            'highlights': {
+                'available': False,
+                'count': 0,
+                'content': []
+            },
+            'message': 'Stories and highlights functionality requires additional Instagram API integration'
+        })
+
+    except Exception as e:
+        logger.error(f"Stories/highlights info error: {str(e)}")
+        return jsonify({'status': 'error', 'message': 'Failed to fetch stories and highlights'}), 500
+
+@app.route('/api/stories-highlights/download', methods=['POST', 'OPTIONS'])
+def download_stories_highlights():
+    """Download stories and highlights (placeholder)"""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
+    try:
+        data = request.get_json()
+        if not data or 'username' not in data:
+            return jsonify({'status': 'error', 'message': 'Username is required'}), 400
+
+        username = data['username'].strip()
+        content_type = data.get('content_type', 'stories')
+        
+        # Placeholder response
+        return jsonify({
+            'status': 'error',
+            'message': f'{content_type.capitalize()} download functionality requires additional Instagram API integration'
+        })
+
+    except Exception as e:
+        logger.error(f"Stories/highlights download error: {str(e)}")
+        return jsonify({'status': 'error', 'message': 'Download failed'}), 500
 
 # ==================== ERROR HANDLERS ====================
 
