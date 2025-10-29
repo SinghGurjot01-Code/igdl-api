@@ -9,10 +9,10 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import yt_dlp
 from flask_cors import CORS
 
-# API-only Flask app (no template rendering)
+# Flask app with proper proxy configuration for production
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Configuration
 DOWNLOAD_FOLDER = 'downloads'
@@ -20,8 +20,33 @@ LOG_FOLDER = 'logs'
 MAX_FILE_AGE_HOURS = 1
 MAX_FILE_SIZE_MB = 100
 RATE_LIMIT_PER_HOUR = 50
-COOKIES_FILE_PATH = '/etc/secrets/cookies.txt'
 
+# Cookie file paths (checked in order)
+COOKIES_FILE_PATHS = [
+    '/etc/secrets/cookies.txt',  # Render Secret Files (primary)
+    './cookies.txt',             # Local development
+    '/tmp/cookies.txt'           # Temporary fallback
+]
+
+def get_cookies_file_path():
+    """Find and validate cookies file"""
+    for path in COOKIES_FILE_PATHS:
+        if os.path.exists(path):
+            try:
+                size = os.path.getsize(path)
+                if size > 0:
+                    logger.info(f"✓ Found valid cookies file: {path} ({size} bytes)")
+                    return path
+                else:
+                    logger.warning(f"⚠️ Cookies file is empty: {path}")
+            except Exception as e:
+                logger.error(f"Error checking cookies file {path}: {str(e)}")
+    
+    logger.warning("⚠️ No valid cookies file found")
+    logger.warning(f"Searched paths: {COOKIES_FILE_PATHS}")
+    return None
+
+# Create necessary directories
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOG_FOLDER, exist_ok=True)
 
@@ -37,14 +62,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger('IGDL')
 
-# Rate limiting storage (in-memory)
-download_tracker = {}
+# Initialize cookies path
+COOKIES_FILE_PATH = get_cookies_file_path()
 
-# Check if cookies file exists
-if os.path.exists(COOKIES_FILE_PATH):
-    logger.info("✓ Instagram cookies loaded from secret file")
-else:
-    logger.warning("⚠️ No cookies.txt found — Instagram private content may fail")
+# Rate limiting storage
+download_tracker = {}
 
 def sanitize_filename(filename):
     """Enhanced filename sanitization with unique ID"""
@@ -55,23 +77,21 @@ def sanitize_filename(filename):
     return f"{name}_{unique_id}{ext}"
 
 def check_rate_limit(ip_address):
-    """Simple rate limiting per IP"""
+    """Rate limiting per IP"""
     current_time = datetime.now()
     
     if ip_address not in download_tracker:
         download_tracker[ip_address] = []
     
-    # Remove old entries (older than 1 hour)
+    # Remove entries older than 1 hour
     download_tracker[ip_address] = [
         timestamp for timestamp in download_tracker[ip_address]
         if current_time - timestamp < timedelta(hours=1)
     ]
     
-    # Check if limit exceeded
     if len(download_tracker[ip_address]) >= RATE_LIMIT_PER_HOUR:
         return False
     
-    # Add current download
     download_tracker[ip_address].append(current_time)
     return True
 
@@ -98,37 +118,43 @@ def cleanup_old_files():
         logger.error(f"Cleanup error: {str(e)}")
         return 0
 
-def log_download_attempt(url, success=True, error_msg=None, file_type=None, username=None):
-    """Log download attempts"""
-    if success:
-        logger.info(f"Download successful - URL: {url}, Type: {file_type}")
+def get_ydl_opts(download=False, output_dir=None):
+    """Get yt-dlp options with or without cookies"""
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        },
+        'socket_timeout': 30,
+        'retries': 3,
+    }
+    
+    if download and output_dir:
+        opts['outtmpl'] = os.path.join(output_dir, '%(title)s.%(ext)s')
+        opts['format'] = 'best[filesize<?100M]'
+    
+    # Add cookies if available
+    if COOKIES_FILE_PATH and os.path.exists(COOKIES_FILE_PATH):
+        opts['cookiefile'] = COOKIES_FILE_PATH
+        logger.debug("Using cookies for request")
     else:
-        logger.error(f"Download failed - URL: {url}, Error: {error_msg}")
+        logger.warning("No cookies available - private content may fail")
+    
+    return opts
 
 def get_media_info_ytdlp(url):
     """Get media information without downloading"""
     try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'cookiefile': COOKIES_FILE_PATH,
-            'extract_flat': False,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            },
-            'socket_timeout': 30,
-            'retries': 3,
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            logger.info(f"Getting info for: {url}")
+        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+            logger.info(f"Fetching info for: {url}")
             info = ydl.extract_info(url, download=False)
             
             if not info:
                 raise Exception("No media found")
             
-            # Enhanced metadata extraction
-            uploader = info.get('uploader', 'Unknown')
+            # Parse upload date
             upload_date = info.get('upload_date', '')
             if upload_date:
                 try:
@@ -136,16 +162,17 @@ def get_media_info_ytdlp(url):
                 except:
                     upload_date = 'Unknown'
             
-            # Determine if it's a carousel (multiple media)
+            # Check if carousel
             is_carousel = False
             media_count = 1
             carousel_media = []
             
             if '_type' in info and info['_type'] == 'playlist':
                 is_carousel = True
-                media_count = len(info.get('entries', []))
-                # Extract carousel media info
-                for entry in info.get('entries', []):
+                entries = info.get('entries', [])
+                media_count = len(entries)
+                
+                for entry in entries:
                     carousel_media.append({
                         'id': entry.get('id', ''),
                         'title': entry.get('title', ''),
@@ -158,7 +185,7 @@ def get_media_info_ytdlp(url):
             result = {
                 'title': info.get('title', 'Instagram Media'),
                 'thumbnail': info.get('thumbnail', ''),
-                'uploader': uploader,
+                'uploader': info.get('uploader', 'Unknown'),
                 'upload_date': upload_date,
                 'like_count': info.get('like_count', 0),
                 'comment_count': info.get('comment_count', 0),
@@ -170,81 +197,27 @@ def get_media_info_ytdlp(url):
                 'url': url
             }
             
-            logger.info(f"Media info retrieved: {result['title']}")
+            logger.info(f"Info retrieved: {result['title']}")
             return result
             
     except Exception as e:
         logger.error(f"Error getting media info: {str(e)}")
         raise e
 
-def get_stories_highlights_info(username):
-    """Get stories and highlights information"""
-    try:
-        # This is a simplified implementation
-        # In a real scenario, you'd use Instagram's API or yt-dlp to get this info
-        result = {
-            'username': username,
-            'stories': {
-                'available': True,
-                'count': 1,  # Placeholder
-                'content': [
-                    {
-                        'id': 'story_1',
-                        'title': f'{username}\'s Story',
-                        'thumbnail': '',  # You'd get this from actual API
-                        'timestamp': datetime.now().isoformat()
-                    }
-                ]
-            },
-            'highlights': {
-                'available': True,
-                'count': 1,  # Placeholder
-                'content': [
-                    {
-                        'id': 'highlight_1',
-                        'title': f'{username}\'s Highlight',
-                        'thumbnail': '',  # You'd get this from actual API
-                        'timestamp': datetime.now().isoformat()
-                    }
-                ]
-            }
-        }
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error getting stories/highlights info: {str(e)}")
-        raise e
-
 def download_media_ytdlp(url):
-    """Download media using yt-dlp with authentication"""
+    """Download media using yt-dlp"""
     temp_dir = None
     try:
         temp_dir = tempfile.mkdtemp()
         
-        ydl_opts = {
-            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-            'quiet': True,
-            'no_warnings': True,
-            'cookiefile': COOKIES_FILE_PATH,
-            'extract_flat': False,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            },
-            'format': 'best[filesize<?100M]',
-            'socket_timeout': 30,
-            'retries': 3,
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(get_ydl_opts(download=True, output_dir=temp_dir)) as ydl:
             logger.info(f"Downloading from: {url}")
             info = ydl.extract_info(url, download=True)
             
             if not info:
                 raise Exception("No media found")
             
-            # Enhanced metadata extraction
-            uploader = info.get('uploader', 'Unknown')
+            # Parse metadata
             upload_date = info.get('upload_date', '')
             if upload_date:
                 try:
@@ -252,30 +225,28 @@ def download_media_ytdlp(url):
                 except:
                     upload_date = 'Unknown'
             
-            # Find all downloaded files
+            # Find downloaded files
             downloaded_files = []
             for root, dirs, files in os.walk(temp_dir):
                 for file in files:
-                    if file.endswith(('.mp4', '.jpg', '.jpeg', '.png', '.webp', '.mkv', '.avi')) and not file.endswith('.txt'):
+                    if file.endswith(('.mp4', '.jpg', '.jpeg', '.png', '.webp', '.mkv', '.avi')):
                         downloaded_files.append(os.path.join(root, file))
             
             if not downloaded_files:
-                raise Exception("No file downloaded")
+                raise Exception("No files downloaded")
             
             # Process files
             results = []
             for downloaded_file in downloaded_files:
                 filename = os.path.basename(downloaded_file)
-                
-                # Check file size
                 file_size = os.path.getsize(downloaded_file)
+                
                 if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
                     logger.warning(f"File too large: {file_size / (1024*1024):.2f}MB")
                     continue
                 
                 safe_filename = sanitize_filename(filename)
                 final_path = os.path.join(DOWNLOAD_FOLDER, safe_filename)
-                
                 shutil.move(downloaded_file, final_path)
                 
                 file_type = 'video' if downloaded_file.endswith(('.mp4', '.mkv', '.avi')) else 'image'
@@ -294,14 +265,14 @@ def download_media_ytdlp(url):
             
             logger.info(f"Successfully downloaded {len(results)} file(s)")
             
-            result = {
+            return {
                 'status': 'success',
                 'type': 'multiple' if len(results) > 1 else results[0]['type'],
                 'files': results,
                 'count': len(results),
                 'title': info.get('title', 'Instagram Media'),
                 'thumbnail': info.get('thumbnail', ''),
-                'uploader': uploader,
+                'uploader': info.get('uploader', 'Unknown'),
                 'upload_date': upload_date,
                 'like_count': info.get('like_count', 0),
                 'comment_count': info.get('comment_count', 0),
@@ -309,94 +280,14 @@ def download_media_ytdlp(url):
                 'duration': info.get('duration', 0)
             }
             
-            log_download_attempt(url, success=True, file_type=result['type'])
-            return result
-            
     except Exception as e:
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
-        log_download_attempt(url, success=False, error_msg=str(e))
-        raise e
-
-def download_stories_highlights_ytdlp(username, content_type='stories'):
-    """Download Instagram stories or highlights"""
-    temp_dir = None
-    try:
-        temp_dir = tempfile.mkdtemp()
-        
-        if content_type == 'stories':
-            url = f'https://www.instagram.com/stories/{username}/'
-            outtmpl = os.path.join(temp_dir, f'%(uploader)s_%(title)s.%(ext)s')
-        else:
-            url = f'https://www.instagram.com/stories/highlights/{username}/'
-            outtmpl = os.path.join(temp_dir, f'%(uploader)s_highlight_%(title)s.%(ext)s')
-        
-        ydl_opts = {
-            'outtmpl': outtmpl,
-            'quiet': True,
-            'no_warnings': True,
-            'cookiefile': COOKIES_FILE_PATH,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            logger.info(f"Downloading {content_type} for user: {username}")
-            info = ydl.extract_info(url, download=False)
-            
-            if not info:
-                raise Exception(f"No {content_type} found for user {username}")
-            
-            ydl.download([url])
-            
-            # Find downloaded files
-            downloaded_files = []
-            for root, dirs, files in os.walk(temp_dir):
-                for file in files:
-                    if file.endswith(('.mp4', '.jpg', '.jpeg', '.png', '.webp')) and not file.endswith('.txt'):
-                        downloaded_files.append(os.path.join(root, file))
-            
-            if not downloaded_files:
-                raise Exception(f"No {content_type} files downloaded")
-            
-            # Move files
-            results = []
-            for file_path in downloaded_files:
-                filename = os.path.basename(file_path)
-                safe_filename = sanitize_filename(filename)
-                final_path = os.path.join(DOWNLOAD_FOLDER, safe_filename)
-                
-                shutil.move(file_path, final_path)
-                
-                results.append({
-                    'filename': safe_filename,
-                    'file_size': os.path.getsize(final_path),
-                    'type': 'video' if filename.endswith('.mp4') else 'image',
-                    'download_url': f'/download/{safe_filename}'
-                })
-            
-            shutil.rmtree(temp_dir)
-            
-            log_download_attempt(url, success=True, file_type=content_type, username=username)
-            
-            return {
-                'status': 'success',
-                'content_type': content_type,
-                'username': username,
-                'files': results,
-                'count': len(results)
-            }
-            
-    except Exception as e:
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-        log_download_attempt(f"{content_type} for {username}", success=False, error_msg=str(e), username=username)
         raise e
 
 @app.before_request
 def before_request():
-    """Run cleanup check before requests (every 30 minutes)"""
+    """Periodic cleanup"""
     if not hasattr(app, '_last_cleanup'):
         app._last_cleanup = datetime.now()
     
@@ -404,27 +295,66 @@ def before_request():
         cleanup_old_files()
         app._last_cleanup = datetime.now()
 
+# ==================== ROUTES ====================
+
 @app.route('/')
 def index():
-    # API-only root to avoid TemplateNotFound errors when frontend is served separately
-    logger.info("Homepage (API) accessed")
+    """API root endpoint"""
+    cookies_ok = COOKIES_FILE_PATH is not None and os.path.exists(COOKIES_FILE_PATH)
     return jsonify({
-        'message': 'Backend running. Serve your frontend separately (local or CDN).',
-        'cookies_configured': os.path.exists(COOKIES_FILE_PATH)
+        'status': 'online',
+        'service': 'Instagram Downloader API',
+        'version': '2.0',
+        'cookies_configured': cookies_ok,
+        'endpoints': {
+            'health': '/health',
+            'download': '/api/download',
+            'media_info': '/api/media/info',
+            'stats': '/api/stats',
+            'debug': '/debug/info'
+        }
     })
 
 @app.route('/health')
 def health_check():
-    """Health check endpoint"""
+    """Health check for monitoring"""
+    cookies_ok = COOKIES_FILE_PATH is not None and os.path.exists(COOKIES_FILE_PATH)
+    
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'cookies_configured': os.path.exists(COOKIES_FILE_PATH)
+        'cookies_configured': cookies_ok,
+        'cookies_path': COOKIES_FILE_PATH if cookies_ok else None
     })
 
-# ============================
-# NEW ENDPOINTS FOR FRONTEND COMPATIBILITY
-# ============================
+@app.route('/debug/info')
+def debug_info():
+    """Debug information endpoint"""
+    info = {
+        'timestamp': datetime.now().isoformat(),
+        'cookies': {
+            'configured': COOKIES_FILE_PATH is not None,
+            'path': COOKIES_FILE_PATH,
+            'exists': os.path.exists(COOKIES_FILE_PATH) if COOKIES_FILE_PATH else False
+        },
+        'paths_checked': COOKIES_FILE_PATHS,
+        'directories': {
+            'downloads': os.path.exists(DOWNLOAD_FOLDER),
+            'logs': os.path.exists(LOG_FOLDER)
+        }
+    }
+    
+    # Add file info if cookies exist
+    if COOKIES_FILE_PATH and os.path.exists(COOKIES_FILE_PATH):
+        try:
+            info['cookies']['size'] = os.path.getsize(COOKIES_FILE_PATH)
+            with open(COOKIES_FILE_PATH, 'r') as f:
+                first_lines = [f.readline().strip() for _ in range(3)]
+            info['cookies']['preview'] = first_lines
+        except Exception as e:
+            info['cookies']['error'] = str(e)
+    
+    return jsonify(info)
 
 @app.route('/api/media/info', methods=['POST'])
 def get_media_info():
@@ -438,11 +368,8 @@ def get_media_info():
         if not url.startswith(('https://www.instagram.com/', 'https://instagram.com/')):
             return jsonify({'status': 'error', 'message': 'Invalid Instagram URL'}), 400
 
-        if not os.path.exists(COOKIES_FILE_PATH):
-            return jsonify({
-                'status': 'error',
-                'message': 'Service not properly configured. Please contact administrator.'
-            }), 503
+        if not COOKIES_FILE_PATH or not os.path.exists(COOKIES_FILE_PATH):
+            logger.warning("Attempting to fetch info without cookies")
 
         media_info = get_media_info_ytdlp(url)
         return jsonify({'status': 'ok', 'media_info': media_info})
@@ -450,52 +377,27 @@ def get_media_info():
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Media info error: {error_msg}")
-        if 'Private' in error_msg or 'login' in error_msg.lower():
+        
+        if 'private' in error_msg.lower() or 'login' in error_msg.lower():
             return jsonify({'status': 'error', 'message': 'This content is private or requires authentication'}), 401
         elif 'not found' in error_msg.lower() or '404' in error_msg:
-            return jsonify({'status': 'error', 'message': 'Media not found or no longer available'}), 404
+            return jsonify({'status': 'error', 'message': 'Media not found'}), 404
         else:
             return jsonify({'status': 'error', 'message': 'Failed to fetch media information'}), 500
 
-
-@app.route('/api/stories-highlights/info', methods=['POST'])
-def get_stories_highlights_info_endpoint():
-    """Get stories and highlights information"""
-    try:
-        data = request.get_json()
-        if not data or 'username' not in data:
-            return jsonify({'status': 'error', 'message': 'Username is required'}), 400
-
-        username = data['username'].strip().lstrip('@')
-        if not username:
-            return jsonify({'status': 'error', 'message': 'Valid username is required'}), 400
-
-        info = get_stories_highlights_info(username)
-        return jsonify({
-            'status': 'ok',
-            'username': username,
-            'stories': info['stories'],
-            'highlights': info['highlights']
-        })
-    except Exception as e:
-        logger.error(f"Stories/highlights info error: {str(e)}")
-        return jsonify({'status': 'error', 'message': 'Failed to fetch stories and highlights information'}), 500
-
-
-# ============================
-# EXISTING ENDPOINTS
-# ============================
-
 @app.route('/api/download', methods=['POST'])
 def download_media():
+    """Download Instagram media"""
     try:
+        # Rate limiting
         client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
         if client_ip:
             client_ip = client_ip.split(',')[0].strip()
 
         if not check_rate_limit(client_ip):
-            return jsonify({'status': 'error', 'message': 'Rate limit exceeded. Please try again later.'}), 429
+            return jsonify({'status': 'error', 'message': 'Rate limit exceeded. Try again later.'}), 429
 
+        # Validate input
         data = request.get_json()
         if not data or 'url' not in data:
             return jsonify({'status': 'error', 'message': 'URL is required'}), 400
@@ -504,9 +406,10 @@ def download_media():
         if not url.startswith(('https://www.instagram.com/', 'https://instagram.com/')):
             return jsonify({'status': 'error', 'message': 'Invalid Instagram URL'}), 400
 
-        if not os.path.exists(COOKIES_FILE_PATH):
-            return jsonify({'status': 'error', 'message': 'Service not properly configured. Please contact administrator.'}), 503
+        if not COOKIES_FILE_PATH or not os.path.exists(COOKIES_FILE_PATH):
+            logger.warning("Attempting download without cookies")
 
+        # Download
         result = download_media_ytdlp(url)
         return jsonify({
             'status': 'ok',
@@ -524,62 +427,25 @@ def download_media():
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Download error: {error_msg}")
-        if 'Private' in error_msg or 'login' in error_msg.lower():
-            return jsonify({'status': 'error', 'message': 'This content is private or requires authentication'}), 401
-        elif 'not found' in error_msg.lower() or '404' in error_msg:
-            return jsonify({'status': 'error', 'message': 'Media not found or no longer available'}), 404
-        elif 'timeout' in error_msg.lower():
-            return jsonify({'status': 'error', 'message': 'Request timed out. Please try again.'}), 504
-        else:
-            return jsonify({'status': 'error', 'message': 'Download failed. Please try again later.'}), 500
-
-
-@app.route('/api/stories-highlights/download', methods=['POST'])
-def download_stories_highlights():
-    try:
-        client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-        if client_ip:
-            client_ip = client_ip.split(',')[0].strip()
-
-        if not check_rate_limit(client_ip):
-            return jsonify({'status': 'error', 'message': 'Rate limit exceeded. Please try again later.'}), 429
-
-        data = request.get_json()
-        if not data or 'username' not in data or 'content_type' not in data:
-            return jsonify({'status': 'error', 'message': 'Username and content type are required'}), 400
-
-        username = data['username'].strip().lstrip('@')
-        content_type = data['content_type']
-        if content_type not in ['stories', 'highlights']:
-            return jsonify({'status': 'error', 'message': 'Content type must be "stories" or "highlights"'}), 400
-
-        result = download_stories_highlights_ytdlp(username, content_type)
-        return jsonify({
-            'status': 'ok',
-            'content_type': content_type,
-            'username': username,
-            'files': result['files'],
-            'count': result['count']
-        })
-
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Stories/highlights download error: {error_msg}")
-        if 'Private' in error_msg or 'login' in error_msg.lower():
-            return jsonify({'status': 'error', 'message': 'This content is private or requires authentication'}), 401
+        
+        if 'private' in error_msg.lower() or 'login' in error_msg.lower():
+            return jsonify({'status': 'error', 'message': 'This content is private'}), 401
         elif 'not found' in error_msg.lower():
-            return jsonify({'status': 'error', 'message': f'No {data.get("content_type")} found for this user'}), 404
+            return jsonify({'status': 'error', 'message': 'Media not found'}), 404
+        elif 'timeout' in error_msg.lower():
+            return jsonify({'status': 'error', 'message': 'Request timed out'}), 504
         else:
-            return jsonify({'status': 'error', 'message': 'Download failed. Please try again later.'}), 500
-
+            return jsonify({'status': 'error', 'message': 'Download failed'}), 500
 
 @app.route('/download/<filename>')
 def download_file(filename):
+    """Serve downloaded file"""
     try:
         safe_filename = sanitize_filename(filename)
         file_path = os.path.join(DOWNLOAD_FOLDER, safe_filename)
 
         if not os.path.exists(file_path):
+            # Try to find similar filename
             base_name = filename.rsplit('_', 1)[0] if '_' in filename else filename
             matching_files = [f for f in os.listdir(DOWNLOAD_FOLDER) if f.startswith(base_name)]
             if matching_files:
@@ -587,60 +453,54 @@ def download_file(filename):
             else:
                 return jsonify({'status': 'error', 'message': 'File not found or expired'}), 404
 
-        logger.info(f"File served: {filename}")
+        logger.info(f"Serving file: {filename}")
         return send_file(file_path, as_attachment=True, download_name=os.path.basename(file_path))
 
     except Exception as e:
         logger.error(f"Error serving file {filename}: {str(e)}")
         return jsonify({'status': 'error', 'message': 'File not available'}), 500
 
-
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
+    """Get service statistics"""
     try:
         download_files = [f for f in os.listdir(DOWNLOAD_FOLDER) if os.path.isfile(os.path.join(DOWNLOAD_FOLDER, f))]
         total_size = sum(os.path.getsize(os.path.join(DOWNLOAD_FOLDER, f)) for f in download_files)
+        
         return jsonify({
             'status': 'ok',
             'stats': {
                 'cached_files': len(download_files),
                 'total_size_mb': round(total_size / (1024 * 1024), 2),
                 'max_age_hours': MAX_FILE_AGE_HOURS,
-                'rate_limit_per_hour': RATE_LIMIT_PER_HOUR
+                'rate_limit_per_hour': RATE_LIMIT_PER_HOUR,
+                'cookies_configured': COOKIES_FILE_PATH is not None
             }
         })
     except Exception as e:
         logger.error(f"Stats error: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-
 @app.route('/api/logs', methods=['GET'])
 def get_logs():
+    """Get recent logs"""
     try:
         lines = request.args.get('lines', 100, type=int)
         if not os.path.exists(log_file):
             return jsonify({'status': 'error', 'message': 'No logs available'}), 404
+        
         with open(log_file, 'r') as f:
             log_lines = f.readlines()[-lines:]
-        return jsonify({'status': 'ok', 'logs': log_lines, 'count': len(log_lines)})
+        
+        return jsonify({
+            'status': 'ok',
+            'logs': log_lines,
+            'count': len(log_lines)
+        })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-
-# ============================
-# ERROR HANDLERS
-# ============================
-
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({'status': 'error', 'message': 'Endpoint not found'}), 404
-
-
-@app.errorhandler(500)
-def internal_error(e):
-    logger.error(f"Internal server error: {str(e)}")
-    return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
-
+# ==================== ERROR HANDLERS ====================
 
 @app.errorhandler(404)
 def not_found(e):
@@ -650,7 +510,20 @@ def not_found(e):
 def internal_error(e):
     logger.error(f"Internal server error: {str(e)}")
     return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
+
+@app.errorhandler(413)
+def request_entity_too_large(e):
+    return jsonify({'status': 'error', 'message': 'File too large'}), 413
+
+# ==================== MAIN ====================
 
 if __name__ == '__main__':
-    logger.info("Starting Instagram Downloader in production mode")
-    app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    logger.info("=" * 50)
+    logger.info("Instagram Downloader API Starting")
+    logger.info(f"Cookies configured: {COOKIES_FILE_PATH is not None}")
+    logger.info(f"Download folder: {DOWNLOAD_FOLDER}")
+    logger.info(f"Log folder: {LOG_FOLDER}")
+    logger.info("=" * 50)
+    
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=False, host='0.0.0.0', port=port)
