@@ -167,35 +167,42 @@ def is_valid_instagram_url(url):
 def get_media_info_ytdlp(url):
     """Get media information without downloading with enhanced error handling"""
     try:
-        # Enhanced yt-dlp options for Instagram
+        # Enhanced yt-dlp options for Instagram with fallback
         ydl_opts = get_ydl_opts()
         ydl_opts.update({
             'extract_flat': False,
             'force_json': True,
             'ignoreerrors': True,
+            'extractor_retries': 3,
         })
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             logger.info(f"Fetching info for: {url}")
             
-            # Test if URL is accessible first
             try:
                 info = ydl.extract_info(url, download=False)
             except yt_dlp.utils.DownloadError as e:
                 error_msg = str(e)
                 logger.error(f"yt-dlp extraction failed: {error_msg}")
                 
-                # More specific error messages
-                if "Private" in error_msg or "login" in error_msg:
-                    raise Exception("This content is private or requires login. Make sure you're using valid cookies.")
-                elif "not found" in error_msg.lower() or "removed" in error_msg.lower():
-                    raise Exception("This content is not available or has been removed from Instagram.")
-                elif "URL could be wrong" in error_msg:
-                    raise Exception("Invalid Instagram URL. Please check the URL and try again.")
-                elif "Unsupported URL" in error_msg:
-                    raise Exception("This Instagram URL format is not supported.")
+                # Try alternative extraction method
+                if "No video formats found" in error_msg:
+                    logger.info("Trying alternative extraction method...")
+                    # Use different extractor args
+                    ydl_opts_alt = ydl_opts.copy()
+                    ydl_opts_alt['extractor_args'] = {
+                        'instagram': {
+                            'format': 'best',
+                            'post_filter': 'image'
+                        }
+                    }
+                    try:
+                        with yt_dlp.YoutubeDL(ydl_opts_alt) as ydl_alt:
+                            info = ydl_alt.extract_info(url, download=False)
+                    except Exception as alt_e:
+                        raise Exception(f"Instagram extraction failed: {str(alt_e)}")
                 else:
-                    raise Exception(f"Instagram returned an error: {error_msg}")
+                    raise
             
             if not info:
                 raise Exception("No media found at this URL. The post might be private or deleted.")
@@ -208,12 +215,11 @@ def get_media_info_ytdlp(url):
                 except:
                     upload_date = 'Unknown'
             
-            # Enhanced carousel detection
+            # Handle carousel posts
             is_carousel = False
             media_count = 1
             carousel_media = []
             
-            # Check for playlist (carousel)
             if info.get('_type') == 'playlist':
                 is_carousel = True
                 entries = info.get('entries', [])
@@ -221,38 +227,21 @@ def get_media_info_ytdlp(url):
                 
                 if entries:
                     for i, entry in enumerate(entries):
-                        # Get the best available URL for each media item
-                        media_url = None
-                        if entry.get('url'):
-                            media_url = entry.get('url')
-                        elif entry.get('formats'):
-                            # Get the best format URL
-                            formats = entry.get('formats', [])
-                            if formats:
-                                best_format = formats[-1]  # Usually the last one is best
-                                media_url = best_format.get('url')
-                        
-                        carousel_media.append({
-                            'id': entry.get('id', f'item_{i}'),
-                            'title': entry.get('title', f'Media {i+1}'),
-                            'thumbnail': entry.get('thumbnail', info.get('thumbnail', '')),
-                            'duration': entry.get('duration', 0),
-                            'width': entry.get('width', 0),
-                            'height': entry.get('height', 0),
-                            'url': media_url,
-                            'index': i,
-                            'is_video': entry.get('duration', 0) > 0,
-                            'ext': entry.get('ext', 'mp4' if entry.get('duration', 0) > 0 else 'jpg')
-                        })
+                        if entry:  # Check if entry is not None
+                            carousel_media.append({
+                                'id': entry.get('id', f'item_{i}'),
+                                'title': entry.get('title', f'Media {i+1}'),
+                                'thumbnail': entry.get('thumbnail', info.get('thumbnail', '')),
+                                'duration': entry.get('duration', 0),
+                                'width': entry.get('width', 0),
+                                'height': entry.get('height', 0),
+                                'url': entry.get('url'),
+                                'index': i,
+                                'is_video': entry.get('duration', 0) > 0,
+                                'ext': entry.get('ext', 'mp4' if entry.get('duration', 0) > 0 else 'jpg')
+                            })
             else:
                 # Single media item
-                media_url = info.get('url')
-                if not media_url and info.get('formats'):
-                    formats = info.get('formats', [])
-                    if formats:
-                        best_format = formats[-1]
-                        media_url = best_format.get('url')
-                
                 carousel_media.append({
                     'id': info.get('id', 'single'),
                     'title': info.get('title', 'Instagram Media'),
@@ -260,7 +249,7 @@ def get_media_info_ytdlp(url):
                     'duration': info.get('duration', 0),
                     'width': info.get('width', 0),
                     'height': info.get('height', 0),
-                    'url': media_url,
+                    'url': info.get('url'),
                     'index': 0,
                     'is_video': info.get('duration', 0) > 0,
                     'ext': info.get('ext', 'mp4' if info.get('duration', 0) > 0 else 'jpg')
@@ -286,24 +275,9 @@ def get_media_info_ytdlp(url):
             logger.info(f"Info retrieved: {result['title']} - {media_count} media items")
             return result
             
-    except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e)
-        logger.error(f"yt-dlp download error: {error_msg}")
-        
-        # Enhanced error handling for Instagram
-        if "No video formats found" in error_msg:
-            raise Exception("This post format is not supported or Instagram has changed their API. Try updating yt-dlp or try a different post.")
-        elif "not available" in error_msg.lower():
-            raise Exception("This content is not available or has been deleted")
-        elif "private" in error_msg.lower():
-            raise Exception("This content is private or requires login")
-        elif "rate limit" in error_msg.lower():
-            raise Exception("Rate limit exceeded. Please try again later.")
-        else:
-            raise Exception(f"Failed to fetch media: {error_msg}")
     except Exception as e:
         logger.error(f"Error getting media info: {str(e)}")
-        raise e
+        raise Exception(f"Failed to fetch media information: {str(e)}")
 
 def download_media_to_buffer(url, item_index=None):
     """Download media directly to memory buffer and return file data"""
@@ -311,77 +285,87 @@ def download_media_to_buffer(url, item_index=None):
     try:
         temp_dir = tempfile.mkdtemp()
         
-        with yt_dlp.YoutubeDL(get_ydl_opts(download=True, output_dir=temp_dir)) as ydl:
-            logger.info(f"Downloading from: {url}")
-            info = ydl.extract_info(url, download=True)
-            
-            if not info:
-                raise Exception("No media found")
-            
-            # Find downloaded files
-            downloaded_files = []
-            for root, dirs, files in os.walk(temp_dir):
-                for file in files:
-                    if file.endswith(('.mp4', '.jpg', '.jpeg', '.png', '.webp', '.mkv', '.avi')):
-                        downloaded_files.append(os.path.join(root, file))
-            
-            if not downloaded_files:
-                raise Exception("No files downloaded")
-            
-            # Process files - read into memory
-            file_data_list = []
-            for downloaded_file in downloaded_files:
-                filename = os.path.basename(downloaded_file)
-                file_size = os.path.getsize(downloaded_file)
-                
-                if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
-                    logger.warning(f"File too large: {file_size / (1024*1024):.2f}MB")
-                    continue
-                
-                # Read file into memory
-                with open(downloaded_file, 'rb') as f:
-                    file_data = io.BytesIO(f.read())
-                
-                safe_filename = sanitize_filename(filename)
-                file_type = 'video' if downloaded_file.endswith(('.mp4', '.mkv', '.avi')) else 'image'
-                
-                file_data_list.append({
-                    'filename': safe_filename,
-                    'file_data': file_data,
-                    'file_size': file_size,
-                    'type': file_type,
-                    'original_name': filename
-                })
-            
-            # Clean up temp directory
-            if temp_dir and os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            
-            if not file_data_list:
-                raise Exception("No valid files downloaded")
-            
-            logger.info(f"Successfully downloaded {len(file_data_list)} file(s) to memory")
-            
-            return {
-                'files': file_data_list,
-                'info': info,
-                'is_carousel': info.get('_type') == 'playlist'
-            }
-            
-    except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e)
-        logger.error(f"yt-dlp download error: {error_msg}")
+        # Try multiple format strategies
+        format_strategies = [
+            'best[filesize<?100M]/best',
+            'best',
+            'worst'  # Sometimes worst quality works when best doesn't
+        ]
         
+        last_error = None
+        for format_strategy in format_strategies:
+            try:
+                ydl_opts = get_ydl_opts(download=True, output_dir=temp_dir)
+                ydl_opts['format'] = format_strategy
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    logger.info(f"Downloading from: {url} with format: {format_strategy}")
+                    info = ydl.extract_info(url, download=True)
+                    
+                    if not info:
+                        continue
+                    
+                    # Find downloaded files
+                    downloaded_files = []
+                    for root, dirs, files in os.walk(temp_dir):
+                        for file in files:
+                            if file.endswith(('.mp4', '.jpg', '.jpeg', '.png', '.webp', '.mkv', '.avi')):
+                                downloaded_files.append(os.path.join(root, file))
+                    
+                    if downloaded_files:
+                        break
+                        
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Format strategy {format_strategy} failed: {str(e)}")
+                continue
+        
+        if not downloaded_files:
+            if last_error:
+                raise last_error
+            else:
+                raise Exception("No files downloaded with any format strategy")
+        
+        # Process files - read into memory
+        file_data_list = []
+        for downloaded_file in downloaded_files:
+            filename = os.path.basename(downloaded_file)
+            file_size = os.path.getsize(downloaded_file)
+            
+            if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+                logger.warning(f"File too large: {file_size / (1024*1024):.2f}MB")
+                continue
+            
+            # Read file into memory
+            with open(downloaded_file, 'rb') as f:
+                file_data = io.BytesIO(f.read())
+            
+            safe_filename = sanitize_filename(filename)
+            file_type = 'video' if downloaded_file.endswith(('.mp4', '.mkv', '.avi')) else 'image'
+            
+            file_data_list.append({
+                'filename': safe_filename,
+                'file_data': file_data,
+                'file_size': file_size,
+                'type': file_type,
+                'original_name': filename
+            })
+        
+        # Clean up temp directory
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
+        
+        if not file_data_list:
+            raise Exception("No valid files downloaded")
+        
+        logger.info(f"Successfully downloaded {len(file_data_list)} file(s) to memory")
+        
+        return {
+            'files': file_data_list,
+            'info': info,
+            'is_carousel': info.get('_type') == 'playlist' if info else False
+        }
             
-        # Enhanced error handling
-        if "No video formats found" in error_msg:
-            raise Exception("This post format is not supported. Try a different post or check if the content is available.")
-        elif "private" in error_msg.lower():
-            raise Exception("This content is private or requires login")
-        else:
-            raise Exception(f"Download failed: {error_msg}")
     except Exception as e:
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
@@ -389,7 +373,7 @@ def download_media_to_buffer(url, item_index=None):
 
 @app.before_request
 def before_request():
-    """Periodic cleanup - simplified since we're not storing files anymore"""
+    """Periodic cleanup"""
     pass
 
 # ==================== ROUTES ====================
@@ -463,7 +447,7 @@ def get_media_info():
         elif 'not supported' in error_msg.lower():
             return jsonify({'status': 'error', 'message': 'This post format is not supported. Try a different post.'}), 400
         else:
-            return jsonify({'status': 'error', 'message': 'Failed to fetch media information'}), 500
+            return jsonify({'status': 'error', 'message': f'Failed to fetch media information: {error_msg}'}), 500
 
 @app.route('/api/download', methods=['POST', 'OPTIONS'])
 def download_media():
@@ -498,18 +482,8 @@ def download_media():
         # Download to memory buffer
         result = download_media_to_buffer(url, item_index)
         
-        # Handle single file download
-        if len(result['files']) == 1:
-            file_data = result['files'][0]
-            return send_file(
-                file_data['file_data'],
-                as_attachment=True,
-                download_name=file_data['filename'],
-                mimetype='video/mp4' if file_data['type'] == 'video' else 'image/jpeg'
-            )
-        
-        # Handle multiple files (carousel) - for now, return first file
-        elif result['files']:
+        # Handle file download
+        if result['files']:
             file_data = result['files'][0]
             if item_index is not None and 0 <= int(item_index) < len(result['files']):
                 file_data = result['files'][int(item_index)]
@@ -538,7 +512,7 @@ def download_media():
         elif 'rate limit' in error_msg.lower():
             return jsonify({'status': 'error', 'message': 'Rate limit exceeded. Please try again later.'}), 429
         else:
-            return jsonify({'status': 'error', 'message': 'Download failed'}), 500
+            return jsonify({'status': 'error', 'message': f'Download failed: {error_msg}'}), 500
 
 if __name__ == '__main__':
     logger.info("=" * 50)
