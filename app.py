@@ -17,13 +17,7 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 # Enable CORS for all domains - crucial for local frontend
-CORS(app, resources={
-    r"/*": {
-        "origins": ["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000", "http://127.0.0.1:8000", "http://localhost:5500", "http://127.0.0.1:5500", "*"],
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
+CORS(app)
 
 # Configuration
 LOG_FOLDER = 'logs'
@@ -87,9 +81,20 @@ download_tracker = {}
 
 def sanitize_filename(filename):
     """Enhanced filename sanitization with unique ID"""
+    if not filename:
+        filename = "instagram_media"
+    
     keepchars = (' ', '.', '_', '-')
     filename = "".join(c for c in filename if c.isalnum() or c in keepchars).rstrip()
+    
+    # If filename is empty after sanitization, use default
+    if not filename:
+        filename = "instagram_media"
+    
     name, ext = os.path.splitext(filename)
+    if not ext:
+        ext = '.mp4'  # Default extension
+    
     unique_id = str(uuid.uuid4())[:8]
     return f"{name}_{unique_id}{ext}"
 
@@ -115,7 +120,7 @@ def check_rate_limit(ip_address):
 def get_ydl_opts(download=False, output_dir=None):
     """Get yt-dlp options with enhanced Instagram support"""
     opts = {
-        'quiet': False,
+        'quiet': True,  # Set to True for production
         'no_warnings': False,
         'extract_flat': False,
         'http_headers': {
@@ -129,12 +134,6 @@ def get_ydl_opts(download=False, output_dir=None):
         'retries': 3,
         'fragment_retries': 3,
         'skip_unavailable_fragments': True,
-        'extractor_args': {
-            'instagram': {
-                'format': 'best',
-                'post_filter': 'none'
-            }
-        },
     }
     
     if download and output_dir:
@@ -171,7 +170,6 @@ def get_media_info_ytdlp(url):
         ydl_opts = get_ydl_opts()
         ydl_opts.update({
             'extract_flat': False,
-            'force_json': True,
             'ignoreerrors': True,
         })
         
@@ -198,7 +196,7 @@ def get_media_info_ytdlp(url):
             if info.get('_type') == 'playlist':
                 is_carousel = True
                 entries = info.get('entries', [])
-                media_count = len(entries) if entries else 1
+                media_count = len([e for e in entries if e]) if entries else 1
                 
                 if entries:
                     for i, entry in enumerate(entries):
@@ -254,90 +252,63 @@ def get_media_info_ytdlp(url):
         logger.error(f"Error getting media info: {str(e)}")
         raise Exception(f"Failed to fetch media information: {str(e)}")
 
-def download_media_to_buffer(url, item_index=None):
+def download_media_to_buffer(url):
     """Download media directly to memory buffer"""
     temp_dir = None
     try:
         temp_dir = tempfile.mkdtemp()
         
-        # Try multiple format strategies
-        format_strategies = [
-            'best[filesize<?100M]/best',
-            'best',
-            'worst'
-        ]
+        ydl_opts = get_ydl_opts(download=True, output_dir=temp_dir)
         
-        last_error = None
-        for format_strategy in format_strategies:
-            try:
-                ydl_opts = get_ydl_opts(download=True, output_dir=temp_dir)
-                ydl_opts['format'] = format_strategy
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    logger.info(f"Downloading from: {url} with format: {format_strategy}")
-                    info = ydl.extract_info(url, download=True)
-                    
-                    if not info:
-                        continue
-                    
-                    # Find downloaded files
-                    downloaded_files = []
-                    for root, dirs, files in os.walk(temp_dir):
-                        for file in files:
-                            if file.endswith(('.mp4', '.jpg', '.jpeg', '.png', '.webp', '.mkv', '.avi')):
-                                downloaded_files.append(os.path.join(root, file))
-                    
-                    if downloaded_files:
-                        break
-                        
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Format strategy {format_strategy} failed: {str(e)}")
-                continue
-        
-        if not downloaded_files:
-            if last_error:
-                raise last_error
-            else:
-                raise Exception("No files downloaded with any format strategy")
-        
-        # Process files
-        file_data_list = []
-        for downloaded_file in downloaded_files:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            logger.info(f"Downloading from: {url}")
+            info = ydl.extract_info(url, download=True)
+            
+            if not info:
+                raise Exception("No media found")
+            
+            # Find downloaded files
+            downloaded_files = []
+            for root, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    if file.endswith(('.mp4', '.jpg', '.jpeg', '.png', '.webp', '.mkv', '.avi')):
+                        downloaded_files.append(os.path.join(root, file))
+            
+            if not downloaded_files:
+                raise Exception("No files downloaded")
+            
+            # Process files - get the first file only (simplified)
+            downloaded_file = downloaded_files[0]  # Just get the first file
             filename = os.path.basename(downloaded_file)
             file_size = os.path.getsize(downloaded_file)
             
             if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
-                logger.warning(f"File too large: {file_size / (1024*1024):.2f}MB")
-                continue
+                raise Exception(f"File too large: {file_size / (1024*1024):.2f}MB")
             
+            # Read file into memory
             with open(downloaded_file, 'rb') as f:
                 file_data = io.BytesIO(f.read())
             
             safe_filename = sanitize_filename(filename)
             file_type = 'video' if downloaded_file.endswith(('.mp4', '.mkv', '.avi')) else 'image'
             
-            file_data_list.append({
+            file_data_list = [{
                 'filename': safe_filename,
                 'file_data': file_data,
                 'file_size': file_size,
                 'type': file_type,
                 'original_name': filename
-            })
+            }]
         
         # Clean up
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         
-        if not file_data_list:
-            raise Exception("No valid files downloaded")
-        
-        logger.info(f"Successfully downloaded {len(file_data_list)} file(s) to memory")
+        logger.info(f"Successfully downloaded file: {safe_filename}")
         
         return {
             'files': file_data_list,
-            'info': info,
-            'is_carousel': info.get('_type') == 'playlist' if info else False
+            'info': info
         }
             
     except Exception as e:
@@ -353,24 +324,23 @@ def index():
     return jsonify({
         'status': 'running',
         'service': 'Instagram Downloader API',
+        'version': '1.0',
         'endpoints': {
             '/api/media/info': 'POST - Get media information',
             '/api/download': 'POST - Download media',
             '/health': 'GET - Health check'
         },
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat(),
+        'cookies_configured': COOKIES_FILE_PATH is not None
     })
 
 @app.route('/health')
 def health_check():
     """Health check for monitoring"""
-    cookies_ok = COOKIES_FILE_PATH is not None and os.path.exists(COOKIES_FILE_PATH)
-    
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'cookies_configured': cookies_ok,
-        'cookies_path': COOKIES_FILE_PATH if cookies_ok else None,
+        'cookies_configured': COOKIES_FILE_PATH is not None,
     })
 
 @app.route('/api/media/info', methods=['POST', 'OPTIONS'])
@@ -424,12 +394,16 @@ def download_media():
         if not is_valid_instagram_url(url):
             return jsonify({'status': 'error', 'message': 'Invalid Instagram URL'}), 400
 
+        logger.info(f"Starting download for: {url}")
+        
         # Download to memory buffer
         result = download_media_to_buffer(url)
         
         # Return first file
         if result['files']:
             file_data = result['files'][0]
+            
+            logger.info(f"Sending file: {file_data['filename']} ({file_data['file_size']} bytes)")
             
             return send_file(
                 file_data['file_data'],
@@ -445,12 +419,21 @@ def download_media():
         logger.error(f"Download error: {error_msg}")
         return jsonify({'status': 'error', 'message': f'Download failed: {error_msg}'}), 500
 
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'status': 'error', 'message': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error(f"Internal server error: {str(e)}")
+    return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
+
 if __name__ == '__main__':
     logger.info("=" * 50)
     logger.info("Instagram Downloader API Starting")
     logger.info(f"Cookies configured: {COOKIES_FILE_PATH is not None}")
     logger.info("CORS: Enabled for all origins")
-    logger.info("Frontend: Can be hosted separately")
+    logger.info("Mode: Backend only - frontend can be hosted separately")
     logger.info("=" * 50)
     
     port = int(os.environ.get('PORT', 5000))
