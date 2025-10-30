@@ -138,7 +138,7 @@ def cleanup_old_files():
 def get_ydl_opts(download=False, output_dir=None):
     """Get yt-dlp options with enhanced Instagram support"""
     opts = {
-        'quiet': False,
+        'quiet': True,
         'no_warnings': False,
         'extract_flat': False,
         'http_headers': {
@@ -152,6 +152,7 @@ def get_ydl_opts(download=False, output_dir=None):
         'retries': 3,
         'fragment_retries': 3,
         'skip_unavailable_fragments': True,
+        'ignoreerrors': True,
         'extractor_args': {
             'instagram': {
                 'format': 'best',
@@ -219,11 +220,14 @@ def get_media_info_ytdlp(url):
                     raise Exception("Invalid Instagram URL. Please check the URL and try again.")
                 elif "Unsupported URL" in error_msg:
                     raise Exception("This Instagram URL format is not supported.")
+                elif "No video formats found" in error_msg:
+                    raise Exception("This post contains content that cannot be downloaded. Try a different post.")
                 else:
                     raise Exception(f"Instagram returned an error: {error_msg}")
             
-            if not info:
-                raise Exception("No media found at this URL. The post might be private or deleted.")
+            # CRITICAL FIX: Check if info is None before processing
+            if info is None:
+                raise Exception("Could not extract media information. This post format may not be supported.")
             
             # Parse upload date
             upload_date = info.get('upload_date', '')
@@ -233,7 +237,7 @@ def get_media_info_ytdlp(url):
                 except:
                     upload_date = 'Unknown'
             
-            # Enhanced carousel detection
+            # Enhanced carousel detection with robust error handling
             is_carousel = False
             media_count = 1
             carousel_media = []
@@ -242,10 +246,12 @@ def get_media_info_ytdlp(url):
             if info.get('_type') == 'playlist':
                 is_carousel = True
                 entries = info.get('entries', [])
-                media_count = len(entries) if entries else 1
+                # Filter out None entries and count valid ones
+                valid_entries = [entry for entry in entries if entry is not None]
+                media_count = len(valid_entries) if valid_entries else 1
                 
-                if entries:
-                    for i, entry in enumerate(entries):
+                if valid_entries:
+                    for i, entry in enumerate(valid_entries):
                         # Get the best available URL for each media item
                         media_url = None
                         if entry.get('url'):
@@ -293,6 +299,21 @@ def get_media_info_ytdlp(url):
                 media_count = 1
                 is_carousel = False
             
+            # If no carousel media was added (all entries were None), create a basic response
+            if not carousel_media:
+                carousel_media.append({
+                    'id': info.get('id', 'single'),
+                    'title': info.get('title', 'Instagram Media'),
+                    'thumbnail': info.get('thumbnail', ''),
+                    'duration': info.get('duration', 0),
+                    'width': info.get('width', 0),
+                    'height': info.get('height', 0),
+                    'url': url,
+                    'index': 0,
+                    'is_video': info.get('duration', 0) > 0,
+                    'ext': 'mp4' if info.get('duration', 0) > 0 else 'jpg'
+                })
+            
             result = {
                 'title': info.get('title', 'Instagram Media'),
                 'thumbnail': info.get('thumbnail', ''),
@@ -317,7 +338,7 @@ def get_media_info_ytdlp(url):
         
         # Enhanced error handling for Instagram
         if "No video formats found" in error_msg:
-            raise Exception("This post format is not supported or Instagram has changed their API. Try updating yt-dlp or try a different post.")
+            raise Exception("This post format is not supported. The post might contain content that cannot be downloaded (like some carousels or restricted content). Try a different post.")
         elif "not available" in error_msg.lower():
             raise Exception("This content is not available or has been deleted")
         elif "private" in error_msg.lower():
@@ -336,12 +357,21 @@ def download_media_ytdlp(url, item_index=None):
     try:
         temp_dir = tempfile.mkdtemp()
         
-        with yt_dlp.YoutubeDL(get_ydl_opts(download=True, output_dir=temp_dir)) as ydl:
+        # Enhanced yt-dlp options for better compatibility
+        ydl_opts = get_ydl_opts(download=True, output_dir=temp_dir)
+        ydl_opts.update({
+            'format': 'best[filesize<?50M]/best',
+            'ignoreerrors': True,
+            'no_overwrites': True,
+        })
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             logger.info(f"Downloading from: {url}")
             info = ydl.extract_info(url, download=True)
             
-            if not info:
-                raise Exception("No media found")
+            # CRITICAL FIX: Check if info is None
+            if info is None:
+                raise Exception("Could not download media. This post format may not be supported.")
             
             # Parse metadata
             upload_date = info.get('upload_date', '')
@@ -359,7 +389,7 @@ def download_media_ytdlp(url, item_index=None):
                         downloaded_files.append(os.path.join(root, file))
             
             if not downloaded_files:
-                raise Exception("No files downloaded")
+                raise Exception("No files downloaded. This post format might not be supported.")
             
             # Process files
             results = []
@@ -389,7 +419,7 @@ def download_media_ytdlp(url, item_index=None):
             shutil.rmtree(temp_dir)
             
             if not results:
-                raise Exception("No valid files downloaded")
+                raise Exception("No valid files downloaded. The post format might not be supported.")
             
             logger.info(f"Successfully downloaded {len(results)} file(s)")
             
@@ -418,14 +448,17 @@ def download_media_ytdlp(url, item_index=None):
             
         # Enhanced error handling
         if "No video formats found" in error_msg:
-            raise Exception("This post format is not supported. Try a different post or check if the content is available.")
+            raise Exception("This post format is not supported. Try a different post or check if the content is available. Some carousel posts may not be downloadable.")
         elif "private" in error_msg.lower():
             raise Exception("This content is private or requires login")
+        elif "not available" in error_msg.lower():
+            raise Exception("This content is not available or has been removed")
         else:
             raise Exception(f"Download failed: {error_msg}")
     except Exception as e:
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
+        logger.error(f"Download error: {str(e)}")
         raise e
 
 @app.before_request
@@ -503,7 +536,7 @@ def get_media_info():
             return jsonify({'status': 'error', 'message': 'Media not found'}), 404
         elif 'rate limit' in error_msg.lower():
             return jsonify({'status': 'error', 'message': 'Rate limit exceeded. Please try again later.'}), 429
-        elif 'not supported' in error_msg.lower():
+        elif 'not supported' in error_msg.lower() or 'no video formats' in error_msg.lower():
             return jsonify({'status': 'error', 'message': 'This post format is not supported. Try a different post.'}), 400
         else:
             return jsonify({'status': 'error', 'message': 'Failed to fetch media information'}), 500
@@ -585,8 +618,8 @@ def download_media():
             return jsonify({'status': 'error', 'message': 'Media not found'}), 404
         elif 'timeout' in error_msg.lower():
             return jsonify({'status': 'error', 'message': 'Request timed out'}), 504
-        elif 'not supported' in error_msg.lower():
-            return jsonify({'status': 'error', 'message': 'This post format is not supported'}), 400
+        elif 'not supported' in error_msg.lower() or 'no video formats' in error_msg.lower():
+            return jsonify({'status': 'error', 'message': 'This post format is not supported. Try a different post.'}), 400
         elif 'rate limit' in error_msg.lower():
             return jsonify({'status': 'error', 'message': 'Rate limit exceeded. Please try again later.'}), 429
         else:
