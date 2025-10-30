@@ -7,7 +7,7 @@ import json
 import re
 import io
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
 import yt_dlp
 from flask_cors import CORS
@@ -17,7 +17,7 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Configuration - No longer using persistent download folder
+# Configuration
 LOG_FOLDER = 'logs'
 MAX_FILE_SIZE_MB = 100
 RATE_LIMIT_PER_HOUR = 50
@@ -398,8 +398,7 @@ def before_request():
 def index():
     """Serve the main HTML page"""
     try:
-        with open('index.html', 'r', encoding='utf-8') as f:
-            return f.read()
+        return send_from_directory('.', 'index.html')
     except FileNotFoundError:
         return """
         <!DOCTYPE html>
@@ -422,45 +421,8 @@ def health_check():
         'timestamp': datetime.now().isoformat(),
         'cookies_configured': cookies_ok,
         'cookies_path': COOKIES_FILE_PATH if cookies_ok else None,
-        'storage': 'memory_buffer'  # Indicate we're using memory buffers now
+        'storage': 'memory_buffer'
     })
-
-@app.route('/debug/info')
-def debug_info():
-    """Debug information endpoint"""
-    info = {
-        'timestamp': datetime.now().isoformat(),
-        'cookies': {
-            'configured': COOKIES_FILE_PATH is not None,
-            'path': COOKIES_FILE_PATH,
-            'exists': os.path.exists(COOKIES_FILE_PATH) if COOKIES_FILE_PATH else False,
-            'writable': False
-        },
-        'paths_checked': COOKIES_FILE_PATHS,
-        'storage_mode': 'memory_buffer',
-        'max_file_size_mb': MAX_FILE_SIZE_MB
-    }
-    
-    # Add file info if cookies exist
-    if COOKIES_FILE_PATH and os.path.exists(COOKIES_FILE_PATH):
-        try:
-            info['cookies']['size'] = os.path.getsize(COOKIES_FILE_PATH)
-            
-            # Check if writable
-            try:
-                with open(COOKIES_FILE_PATH, 'a'):
-                    pass
-                info['cookies']['writable'] = True
-            except:
-                info['cookies']['writable'] = False
-            
-            with open(COOKIES_FILE_PATH, 'r') as f:
-                first_lines = [f.readline().strip() for _ in range(3)]
-            info['cookies']['preview'] = first_lines
-        except Exception as e:
-            info['cookies']['error'] = str(e)
-    
-    return jsonify(info)
 
 @app.route('/api/media/info', methods=['POST', 'OPTIONS'])
 def get_media_info():
@@ -547,7 +509,6 @@ def download_media():
             )
         
         # Handle multiple files (carousel) - for now, return first file
-        # In a more advanced implementation, you could create a zip file
         elif result['files']:
             file_data = result['files'][0]
             if item_index is not None and 0 <= int(item_index) < len(result['files']):
@@ -578,121 +539,6 @@ def download_media():
             return jsonify({'status': 'error', 'message': 'Rate limit exceeded. Please try again later.'}), 429
         else:
             return jsonify({'status': 'error', 'message': 'Download failed'}), 500
-
-# Remove the old /download/<filename> endpoint since we're not storing files anymore
-
-@app.route('/api/stats', methods=['GET'])
-def get_stats():
-    """Get service statistics"""
-    try:
-        return jsonify({
-            'status': 'ok',
-            'stats': {
-                'storage_mode': 'memory_buffer',
-                'max_file_size_mb': MAX_FILE_SIZE_MB,
-                'rate_limit_per_hour': RATE_LIMIT_PER_HOUR,
-                'cookies_configured': COOKIES_FILE_PATH is not None
-            }
-        })
-    except Exception as e:
-        logger.error(f"Stats error: {str(e)}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-@app.route('/api/logs', methods=['GET'])
-def get_logs():
-    """Get recent logs"""
-    try:
-        lines = request.args.get('lines', 100, type=int)
-        if not os.path.exists(log_file):
-            return jsonify({'status': 'error', 'message': 'No logs available'}), 404
-        
-        with open(log_file, 'r') as f:
-            log_lines = f.readlines()[-lines:]
-        
-        return jsonify({
-            'status': 'ok',
-            'logs': log_lines,
-            'count': len(log_lines)
-        })
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-# ==================== STORIES & HIGHLIGHTS ROUTES ====================
-
-@app.route('/api/stories-highlights/info', methods=['POST', 'OPTIONS'])
-def get_stories_highlights_info():
-    """Get stories and highlights information (placeholder)"""
-    if request.method == 'OPTIONS':
-        return '', 200
-        
-    try:
-        data = request.get_json()
-        if not data or 'username' not in data:
-            return jsonify({'status': 'error', 'message': 'Username is required'}), 400
-
-        username = data['username'].strip()
-        
-        # Placeholder response - in a real implementation, you would fetch actual stories/highlights
-        return jsonify({
-            'status': 'ok',
-            'username': username,
-            'stories': {
-                'available': False,
-                'count': 0,
-                'content': []
-            },
-            'highlights': {
-                'available': False,
-                'count': 0,
-                'content': []
-            },
-            'message': 'Stories and highlights functionality requires additional Instagram API integration'
-        })
-
-    except Exception as e:
-        logger.error(f"Stories/highlights info error: {str(e)}")
-        return jsonify({'status': 'error', 'message': 'Failed to fetch stories and highlights'}), 500
-
-@app.route('/api/stories-highlights/download', methods=['POST', 'OPTIONS'])
-def download_stories_highlights():
-    """Download stories and highlights (placeholder)"""
-    if request.method == 'OPTIONS':
-        return '', 200
-        
-    try:
-        data = request.get_json()
-        if not data or 'username' not in data:
-            return jsonify({'status': 'error', 'message': 'Username is required'}), 400
-
-        username = data['username'].strip()
-        content_type = data.get('content_type', 'stories')
-        
-        # Placeholder response
-        return jsonify({
-            'status': 'error',
-            'message': f'{content_type.capitalize()} download functionality requires additional Instagram API integration'
-        })
-
-    except Exception as e:
-        logger.error(f"Stories/highlights download error: {str(e)}")
-        return jsonify({'status': 'error', 'message': 'Download failed'}), 500
-
-# ==================== ERROR HANDLERS ====================
-
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({'status': 'error', 'message': 'Endpoint not found'}), 404
-
-@app.errorhandler(500)
-def internal_error(e):
-    logger.error(f"Internal server error: {str(e)}")
-    return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
-
-@app.errorhandler(413)
-def request_entity_too_large(e):
-    return jsonify({'status': 'error', 'message': 'File too large'}), 413
-
-# ==================== MAIN ====================
 
 if __name__ == '__main__':
     logger.info("=" * 50)
