@@ -7,7 +7,7 @@ import json
 import re
 import io
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask import Flask, request, jsonify, send_file
 from werkzeug.middleware.proxy_fix import ProxyFix
 import yt_dlp
 from flask_cors import CORS
@@ -15,7 +15,15 @@ from flask_cors import CORS
 # Flask app with proper proxy configuration for production
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
-CORS(app, resources={r"/*": {"origins": "*"}})
+
+# Enable CORS for all domains - crucial for local frontend
+CORS(app, resources={
+    r"/*": {
+        "origins": ["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000", "http://127.0.0.1:8000", "http://localhost:5500", "http://127.0.0.1:5500", "*"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 # Configuration
 LOG_FOLDER = 'logs'
@@ -33,7 +41,6 @@ def get_cookies_file_path():
     """Find cookies file and copy to writable location if needed"""
     writable_path = '/tmp/cookies.txt'
     
-    # Check all possible paths
     for path in COOKIES_FILE_PATHS:
         if os.path.exists(path):
             try:
@@ -41,7 +48,6 @@ def get_cookies_file_path():
                 if size > 0:
                     logger.info(f"✓ Found cookies file: {path} ({size} bytes)")
                     
-                    # If it's in read-only /etc/secrets, copy to /tmp
                     if path.startswith('/etc/secrets/'):
                         try:
                             shutil.copy2(path, writable_path)
@@ -51,15 +57,11 @@ def get_cookies_file_path():
                             logger.error(f"Failed to copy cookies: {str(e)}")
                             return None
                     else:
-                        # Already in writable location
                         return path
-                else:
-                    logger.warning(f"⚠️ Cookies file is empty: {path}")
             except Exception as e:
                 logger.error(f"Error checking cookies file {path}: {str(e)}")
     
     logger.warning("⚠️ No valid cookies file found")
-    logger.warning(f"Searched paths: {COOKIES_FILE_PATHS}")
     return None
 
 # Create necessary directories
@@ -137,7 +139,6 @@ def get_ydl_opts(download=False, output_dir=None):
     
     if download and output_dir:
         opts['outtmpl'] = os.path.join(output_dir, '%(title)s.%(ext)s')
-        # Enhanced format selection for Instagram
         opts['format'] = 'best[filesize<?100M]/best'
         opts['merge_output_format'] = 'mp4'
     
@@ -165,47 +166,21 @@ def is_valid_instagram_url(url):
     return False
 
 def get_media_info_ytdlp(url):
-    """Get media information without downloading with enhanced error handling"""
+    """Get media information without downloading"""
     try:
-        # Enhanced yt-dlp options for Instagram with fallback
         ydl_opts = get_ydl_opts()
         ydl_opts.update({
             'extract_flat': False,
             'force_json': True,
             'ignoreerrors': True,
-            'extractor_retries': 3,
         })
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             logger.info(f"Fetching info for: {url}")
-            
-            try:
-                info = ydl.extract_info(url, download=False)
-            except yt_dlp.utils.DownloadError as e:
-                error_msg = str(e)
-                logger.error(f"yt-dlp extraction failed: {error_msg}")
-                
-                # Try alternative extraction method
-                if "No video formats found" in error_msg:
-                    logger.info("Trying alternative extraction method...")
-                    # Use different extractor args
-                    ydl_opts_alt = ydl_opts.copy()
-                    ydl_opts_alt['extractor_args'] = {
-                        'instagram': {
-                            'format': 'best',
-                            'post_filter': 'image'
-                        }
-                    }
-                    try:
-                        with yt_dlp.YoutubeDL(ydl_opts_alt) as ydl_alt:
-                            info = ydl_alt.extract_info(url, download=False)
-                    except Exception as alt_e:
-                        raise Exception(f"Instagram extraction failed: {str(alt_e)}")
-                else:
-                    raise
+            info = ydl.extract_info(url, download=False)
             
             if not info:
-                raise Exception("No media found at this URL. The post might be private or deleted.")
+                raise Exception("No media found at this URL")
             
             # Parse upload date
             upload_date = info.get('upload_date', '')
@@ -280,7 +255,7 @@ def get_media_info_ytdlp(url):
         raise Exception(f"Failed to fetch media information: {str(e)}")
 
 def download_media_to_buffer(url, item_index=None):
-    """Download media directly to memory buffer and return file data"""
+    """Download media directly to memory buffer"""
     temp_dir = None
     try:
         temp_dir = tempfile.mkdtemp()
@@ -289,7 +264,7 @@ def download_media_to_buffer(url, item_index=None):
         format_strategies = [
             'best[filesize<?100M]/best',
             'best',
-            'worst'  # Sometimes worst quality works when best doesn't
+            'worst'
         ]
         
         last_error = None
@@ -326,7 +301,7 @@ def download_media_to_buffer(url, item_index=None):
             else:
                 raise Exception("No files downloaded with any format strategy")
         
-        # Process files - read into memory
+        # Process files
         file_data_list = []
         for downloaded_file in downloaded_files:
             filename = os.path.basename(downloaded_file)
@@ -336,7 +311,6 @@ def download_media_to_buffer(url, item_index=None):
                 logger.warning(f"File too large: {file_size / (1024*1024):.2f}MB")
                 continue
             
-            # Read file into memory
             with open(downloaded_file, 'rb') as f:
                 file_data = io.BytesIO(f.read())
             
@@ -351,7 +325,7 @@ def download_media_to_buffer(url, item_index=None):
                 'original_name': filename
             })
         
-        # Clean up temp directory
+        # Clean up
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         
@@ -371,29 +345,21 @@ def download_media_to_buffer(url, item_index=None):
             shutil.rmtree(temp_dir)
         raise e
 
-@app.before_request
-def before_request():
-    """Periodic cleanup"""
-    pass
-
 # ==================== ROUTES ====================
 
 @app.route('/')
 def index():
-    """Serve the main HTML page"""
-    try:
-        return send_from_directory('.', 'index.html')
-    except FileNotFoundError:
-        return """
-        <!DOCTYPE html>
-        <html>
-        <head><title>IGDL - Instagram Downloader</title></head>
-        <body>
-            <h1>IGDL - Instagram Downloader</h1>
-            <p>Frontend file not found. Please make sure index.html is deployed.</p>
-        </body>
-        </html>
-        """
+    """Simple API info page"""
+    return jsonify({
+        'status': 'running',
+        'service': 'Instagram Downloader API',
+        'endpoints': {
+            '/api/media/info': 'POST - Get media information',
+            '/api/download': 'POST - Download media',
+            '/health': 'GET - Health check'
+        },
+        'timestamp': datetime.now().isoformat()
+    })
 
 @app.route('/health')
 def health_check():
@@ -405,7 +371,6 @@ def health_check():
         'timestamp': datetime.now().isoformat(),
         'cookies_configured': cookies_ok,
         'cookies_path': COOKIES_FILE_PATH if cookies_ok else None,
-        'storage': 'memory_buffer'
     })
 
 @app.route('/api/media/info', methods=['POST', 'OPTIONS'])
@@ -421,15 +386,11 @@ def get_media_info():
 
         url = data['url'].strip()
         
-        # Enhanced URL validation
         if not is_valid_instagram_url(url):
             return jsonify({
                 'status': 'error', 
-                'message': 'Invalid Instagram URL. Supported formats: Posts (instagram.com/p/...), Reels (instagram.com/reel/...), Stories (instagram.com/stories/...), TV (instagram.com/tv/...)'
+                'message': 'Invalid Instagram URL. Supported formats: Posts, Reels, Stories, TV'
             }), 400
-
-        if not COOKIES_FILE_PATH or not os.path.exists(COOKIES_FILE_PATH):
-            logger.warning("Attempting to fetch info without cookies")
 
         media_info = get_media_info_ytdlp(url)
         return jsonify({'status': 'ok', 'media_info': media_info})
@@ -437,17 +398,7 @@ def get_media_info():
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Media info error: {error_msg}")
-        
-        if 'private' in error_msg.lower() or 'login' in error_msg.lower():
-            return jsonify({'status': 'error', 'message': 'This content is private or requires authentication'}), 401
-        elif 'not found' in error_msg.lower() or '404' in error_msg:
-            return jsonify({'status': 'error', 'message': 'Media not found'}), 404
-        elif 'rate limit' in error_msg.lower():
-            return jsonify({'status': 'error', 'message': 'Rate limit exceeded. Please try again later.'}), 429
-        elif 'not supported' in error_msg.lower():
-            return jsonify({'status': 'error', 'message': 'This post format is not supported. Try a different post.'}), 400
-        else:
-            return jsonify({'status': 'error', 'message': f'Failed to fetch media information: {error_msg}'}), 500
+        return jsonify({'status': 'error', 'message': f'Failed to fetch media information: {error_msg}'}), 500
 
 @app.route('/api/download', methods=['POST', 'OPTIONS'])
 def download_media():
@@ -473,20 +424,12 @@ def download_media():
         if not is_valid_instagram_url(url):
             return jsonify({'status': 'error', 'message': 'Invalid Instagram URL'}), 400
 
-        # Check if specific item is requested
-        item_index = data.get('item_index')
-        
-        if not COOKIES_FILE_PATH or not os.path.exists(COOKIES_FILE_PATH):
-            logger.warning("Attempting download without cookies")
-
         # Download to memory buffer
-        result = download_media_to_buffer(url, item_index)
+        result = download_media_to_buffer(url)
         
-        # Handle file download
+        # Return first file
         if result['files']:
             file_data = result['files'][0]
-            if item_index is not None and 0 <= int(item_index) < len(result['files']):
-                file_data = result['files'][int(item_index)]
             
             return send_file(
                 file_data['file_data'],
@@ -500,26 +443,14 @@ def download_media():
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Download error: {error_msg}")
-        
-        if 'private' in error_msg.lower() or 'login' in error_msg.lower():
-            return jsonify({'status': 'error', 'message': 'This content is private'}), 401
-        elif 'not found' in error_msg.lower():
-            return jsonify({'status': 'error', 'message': 'Media not found'}), 404
-        elif 'timeout' in error_msg.lower():
-            return jsonify({'status': 'error', 'message': 'Request timed out'}), 504
-        elif 'not supported' in error_msg.lower():
-            return jsonify({'status': 'error', 'message': 'This post format is not supported'}), 400
-        elif 'rate limit' in error_msg.lower():
-            return jsonify({'status': 'error', 'message': 'Rate limit exceeded. Please try again later.'}), 429
-        else:
-            return jsonify({'status': 'error', 'message': f'Download failed: {error_msg}'}), 500
+        return jsonify({'status': 'error', 'message': f'Download failed: {error_msg}'}), 500
 
 if __name__ == '__main__':
     logger.info("=" * 50)
     logger.info("Instagram Downloader API Starting")
     logger.info(f"Cookies configured: {COOKIES_FILE_PATH is not None}")
-    logger.info("Storage mode: Memory buffer (no persistent files)")
-    logger.info(f"Log folder: {LOG_FOLDER}")
+    logger.info("CORS: Enabled for all origins")
+    logger.info("Frontend: Can be hosted separately")
     logger.info("=" * 50)
     
     port = int(os.environ.get('PORT', 5000))
